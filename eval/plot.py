@@ -2,31 +2,32 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Read the CSV file
-df = pd.read_csv("infedit_paper_vs_mine.csv")
+infedit = pd.read_csv("infedit_paper_vs_mine.csv")
+pix2pix = pd.read_csv("pix2pix_paper_vs_mine.csv")
 
-# Clean column names in case of extra spaces
-df.columns = df.columns.str.strip()
+infedit.columns = infedit.columns.str.strip()
+pix2pix.columns = pix2pix.columns.str.strip()
 
-# Extract columns
-metrics = df["Metric"]
-paper = df["InfEdit Paper (VI* UAC)"]
-mine = df["My Reproduction"]
-diff = df["Difference (Mine - Paper)"]
+df = pd.DataFrame({
+    "Metric": pix2pix["Metric"],
+    "Pix2Pix (My Reproduction)": pix2pix["My Reproduction"],
+    "InfEdit (My Reproduction)": infedit["My Reproduction"],
+    "InfEdit (Paper)": infedit["InfEdit Paper (VI* UAC)"]
+})
 
-# -------------------------
-# Plot 1: Paper vs Mine
-# -------------------------
-x = np.arange(len(metrics))
-width = 0.35
+print(df)
 
-plt.figure(figsize=(10, 5))
-plt.bar(x - width/2, paper, width, label="Paper")
-plt.bar(x + width/2, mine, width, label="My Reproduction")
+x = np.arange(len(df["Metric"]))
+width = 0.25
 
-plt.xticks(x, metrics, rotation=20, ha="right")
+plt.figure(figsize=(12, 6))
+plt.bar(x - width, df["Pix2Pix (My Reproduction)"], width, label="Pix2Pix (Our Reproduction)")
+plt.bar(x, df["InfEdit (My Reproduction)"], width, label="InfEdit (Our Reproduction)")
+plt.bar(x + width, df["InfEdit (Paper)"], width, label="InfEdit (Paper)")
+
+plt.xticks(x, df["Metric"], rotation=20, ha="right")
 plt.ylabel("Metric Value")
-plt.title("InfEdit: Paper vs Our Reproduction")
+plt.title("Pix2Pix vs InfEdit on PIE-Bench")
 plt.legend()
 plt.tight_layout()
 plt.show()

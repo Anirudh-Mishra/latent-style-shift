@@ -172,6 +172,7 @@ all_tgt_image_folders={
     "8_ablation_directinversion_add-source+p2p":"output/ablation_directinversion_add-source+p2p/annotation_images",
     "8_ablation_directinversion_add-target+p2p":"output/ablation_directinversion_add-target+p2p/annotation_images",
     "infedit": r"D:\CMU\Projects\InfEdit\infedit_outputs\annotation_images",
+    "pix2pix": "pix2pix_outputs/annotation_images",
     }
 
 
