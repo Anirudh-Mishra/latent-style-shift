@@ -4,8 +4,10 @@ import math
 import json
 import argparse
 import time
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,6 +86,19 @@ class ImageTextDataset(Dataset):
 
 
 def train(args):
+    # deterministic seeding
+    def set_seed(s):
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    if args.seed is not None:
+        set_seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
@@ -95,13 +110,15 @@ def train(args):
     vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype)
     vae = vae.to(device)
     vae.eval()
-    vae.requires_grad_(False)
+    if args.freeze_vae:
+        vae.requires_grad_(False)
 
     tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=dtype)
     text_encoder = text_encoder.to(device)
     text_encoder.eval()
-    text_encoder.requires_grad_(False)
+    if args.freeze_text_encoder:
+        text_encoder.requires_grad_(False)
 
     model = UViTBackbone.from_preset(
         args.uvit_size,
@@ -135,6 +152,10 @@ def train(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        generator=(torch.Generator().manual_seed(args.seed) if args.seed is not None else None),
+        worker_init_fn=(
+            (lambda wid: torch.manual_seed(args.seed + wid)) if args.seed is not None else None
+        ),
     )
 
     optimizer = torch.optim.AdamW(
@@ -143,6 +164,11 @@ def train(args):
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
     )
+
+    # mixed precision scaler
+    scaler = None
+    if args.use_amp:
+        scaler = torch.cuda.amp.GradScaler()
 
     total_steps = len(dataloader) * args.num_epochs
     warmup_steps = min(args.warmup_steps, total_steps // 10)
@@ -189,16 +215,28 @@ def train(args):
             noise = torch.randn_like(latents)
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
-            noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
+            if args.use_amp:
+                with torch.cuda.amp.autocast():
+                    noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
+                    loss = F.mse_loss(noise_pred, noise)
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                if args.max_grad_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                lr_scheduler.step()
+            else:
+                noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
+                loss = F.mse_loss(noise_pred, noise)
 
-            loss = F.mse_loss(noise_pred, noise)
-
-            optimizer.zero_grad()
-            loss.backward()
-            if args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            lr_scheduler.step()
+                optimizer.zero_grad()
+                loss.backward()
+                if args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
 
             epoch_loss += loss.item()
             global_step += 1
@@ -217,11 +255,25 @@ def train(args):
             torch.save(model.state_dict(), ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
 
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                best_path = os.path.join(args.output_dir, f"uvit_{args.uvit_size}_best.pt")
-                torch.save(model.state_dict(), best_path)
-                print(f"New best model: {best_path}")
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            best_path = os.path.join(args.output_dir, f"uvit_{args.uvit_size}_best.pt")
+            torch.save(model.state_dict(), best_path)
+            print(f"New best model: {best_path}")
+
+        # always save metadata for this epoch
+        meta = {
+            "epoch": epoch + 1,
+            "global_step": global_step,
+            "epoch_loss": epoch_loss,
+            "best_loss": best_loss,
+            "args": vars(args),
+        }
+        try:
+            with open(os.path.join(args.output_dir, f"uvit_{args.uvit_size}_epoch{epoch + 1}.meta.json"), "w") as mf:
+                json.dump(meta, mf, indent=2)
+        except Exception:
+            pass
 
     print(f"\nTraining complete. Best loss: {best_loss:.4f}")
     print(f"Checkpoints saved to: {args.output_dir}")
@@ -238,6 +290,14 @@ if __name__ == "__main__":
                         choices=["small", "mid", "large"])
     parser.add_argument("--patch_size", type=int, default=2)
     parser.add_argument("--resume", type=str, default=None)
+
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--use_amp", action="store_true", help="Use mixed precision (AMP)")
+    parser.add_argument("--freeze_vae", dest="freeze_vae", action="store_true", help="Freeze pretrained VAE")
+    parser.add_argument("--no_freeze_vae", dest="freeze_vae", action="store_false", help="Do not freeze VAE")
+    parser.add_argument("--freeze_text_encoder", dest="freeze_text_encoder", action="store_true", help="Freeze CLIP text encoder")
+    parser.add_argument("--no_freeze_text_encoder", dest="freeze_text_encoder", action="store_false", help="Do not freeze text encoder")
+    parser.set_defaults(freeze_vae=True, freeze_text_encoder=True)
 
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=100)

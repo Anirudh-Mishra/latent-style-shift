@@ -355,6 +355,13 @@ def get_equalizer(text: str, word_select: Union[int, Tuple[int, ...]], values: U
         equalizer[:, inds] = values
     return equalizer
 
+def _has_processors_on_unet(unet):
+    for m in unet.modules():
+        if hasattr(m, "processor") and getattr(m, "processor") is not None:
+            return True
+    return False
+
+
 def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, local, mutual, guidance_s, guidance_t, num_inference_steps=10,
               width=512, height=512, seed=0, img=None, strength=0.7,
                cross_replace_steps=0.8, self_replace_steps=0.4, eta=0.1, thresh_e=0.3, thresh_m=0.3, denoise=True):
@@ -376,6 +383,10 @@ def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, lo
                     local_blend=local_blend
                     )
     ptp_utils.register_attention_control(pipe, controller)
+
+    # sanity: ensure attention processors attached to the model (UViT or UNet)
+    if not _has_processors_on_unet(pipe.unet):
+        raise RuntimeError("No attention processors attached to the pipeline unet; UAC may not be active.")
 
     results = pipe(prompt=target_prompt,
                    source_prompt=source_prompt,
@@ -408,6 +419,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source_path', type=str, required=True)
     parser.add_argument('--target_path', type=str, required=True)
+    # inference parameter overrides (optional)
+    parser.add_argument('--num_inference_steps', type=int, default=12)
+    parser.add_argument('--strength', type=float, default=1.0)
+    parser.add_argument('--cross_replace_steps', type=float, default=0.7)
+    parser.add_argument('--self_replace_steps', type=float, default=0.7)
+    parser.add_argument('--eta', type=float, default=1.0)
+    parser.add_argument('--thresh_e', type=float, default=0.55)
+    parser.add_argument('--thresh_m', type=float, default=0.6)
+    parser.add_argument('--denoise', action='store_true', help='Run denoise mode (if not set uses denoise=False)')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed for inference')
     parser.add_argument('--backbone', type=str, default='unet', choices=['unet', 'uvit'])
     parser.add_argument('--uvit_size', type=str, default='mid', choices=['small', 'mid', 'large'])
     parser.add_argument('--uvit_checkpoint', type=str, default=None)
@@ -434,9 +455,17 @@ def main():
             local = annotation["blended_word"].split(" ")[1]
         else:
             local = ""
-        image_out = inference(source_prompt, target_prompt, "", "", local, "", 1, 2.3, num_inference_steps=12,
-                width=512, height=512, seed=0, img=imagein, strength=1,
-                cross_replace_steps=0.7, self_replace_steps=0.7, eta=1, thresh_e=0.55, thresh_m=0.6, denoise=False)
+        image_out = inference(
+            source_prompt, target_prompt, "", "", local, "", 1, 2.3,
+            num_inference_steps=args.num_inference_steps,
+            width=512, height=512, seed=args.seed, img=imagein,
+            strength=args.strength,
+            cross_replace_steps=args.cross_replace_steps,
+            self_replace_steps=args.self_replace_steps,
+            eta=args.eta,
+            thresh_e=args.thresh_e,
+            thresh_m=args.thresh_m,
+            denoise=args.denoise)
         annotation_dir = os.path.dirname(annotation["image_path"])
 
         # Create the full directory path
