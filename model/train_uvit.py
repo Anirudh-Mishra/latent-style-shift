@@ -15,7 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 
-from diffusers import AutoencoderKL, LCMScheduler
+from diffusers import AutoencoderKL, LCMScheduler, DDPMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -30,18 +30,19 @@ class ImageTextDataset(Dataset):
         self.max_length = max_length
         self.pairs = []
 
-        metadata_path = self.data_dir / "metadata.json"
+        metadata_path = self.data_dir / "mapping_file.json"
         if metadata_path.exists():
             with open(metadata_path) as f:
                 metadata = json.load(f)
             if isinstance(metadata, list):
                 for entry in metadata:
-                    img_path = self.data_dir / entry["file_name"]
+                    img_path = self.data_dir / "annotation_images" /entry["image_path"]
                     if img_path.exists():
                         self.pairs.append((str(img_path), entry["text"]))
             elif isinstance(metadata, dict):
-                for fname, text in metadata.items():
-                    img_path = self.data_dir / fname
+                for fname, dict_data in metadata.items():
+                    img_path = self.data_dir / "annotation_images" / dict_data["image_path"]
+                    text = dict_data["editing_prompt"]
                     if img_path.exists():
                         self.pairs.append((str(img_path), text))
         else:
@@ -55,7 +56,7 @@ class ImageTextDataset(Dataset):
                     self.pairs.append((str(img_path), caption))
 
         if len(self.pairs) == 0:
-            raise ValueError(f"No image-text pairs found in {data_dir}")
+            raise ValueError(f"No image-text pairs found in {img_path}")
         print(f"Found {len(self.pairs)} image-text pairs")
 
         self.transform = transforms.Compose([
@@ -138,7 +139,7 @@ def train(args):
     print(f"U-ViT parameters: {num_params / 1e6:.1f}M")
 
     scheduler = LCMScheduler.from_pretrained(model_id, subfolder="scheduler")
-    scheduler.set_timesteps(1000, device=device)
+    # scheduler.set_timesteps(1000, device=device)
 
     dataset = ImageTextDataset(
         args.data_dir,
