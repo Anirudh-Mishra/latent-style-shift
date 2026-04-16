@@ -42,7 +42,7 @@ class ImageTextDataset(Dataset):
             elif isinstance(metadata, dict):
                 for fname, dict_data in metadata.items():
                     img_path = self.data_dir / "annotation_images" / dict_data["image_path"]
-                    text = dict_data["editing_prompt"]
+                    text = dict_data["editing_instruction"]
                     if img_path.exists():
                         self.pairs.append((str(img_path), text))
         else:

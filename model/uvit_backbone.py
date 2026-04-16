@@ -289,7 +289,14 @@ class UViTBackbone(nn.Module):
 
         x = self.patch_embed(x)
 
-        time_token = self.time_embed(timestep_embedding(timesteps, self.embed_dim))
+        # Generate the embeddings
+        t_emb = timestep_embedding(timesteps, self.embed_dim)
+
+        # Cast them to match the dtype of the incoming sample/latents
+        t_emb = t_emb.to(dtype=x.dtype) 
+
+        # Pass through the linear layers
+        time_token = self.time_embed(t_emb)
         time_token = time_token.unsqueeze(1)
 
         x = torch.cat([time_token, x], dim=1)

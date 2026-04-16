@@ -4,8 +4,6 @@
 module load anaconda3
 
 # 2. Initialize Conda for the script and activate your specific environment
-# We use 'source' because 'conda activate' doesn't work in standard scripts without it
-source /opt/packages/anaconda/anaconda3/etc/profile.d/conda.sh
 conda deactivate  # Ensures we exit the base environment first
 conda activate /ocean/projects/cis260127p/shared/UNetENV
 
@@ -19,3 +17,7 @@ module load cudnn
 module load cuda
 
 echo "Setup complete! Environment and data are ready."
+
+python model/train_uvit.py   --data_dir /tmp/UNet_Data/PIE-Bench_v1/   --uvit_size mid   --batch_size 8   --num_epochs 100   --lr 1e-4   --output_dir /ocean/projects/cis260127p/adube1/outputs/uvit_mid_seed42_edit_instruction/   --seed 42   --use_amp
+
+python model/run_uvit_inference.py --checkpoint /ocean/projects/cis260127p/adube1/outputs/uvit_mid_seed42_edit_instruction/uvit_mid_best.pt --source_path /tmp/UNet_Data/PIE-Bench_v1/ --target_path /ocean/projects/cis260127p/adube1/outputs/uvit_mid_seed42_eval_edit_instruction
