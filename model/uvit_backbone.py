@@ -27,17 +27,22 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 
 
 def patchify(imgs, patch_size):
-    return einops.rearrange(
-        imgs, "B C (h p1) (w p2) -> B (h w) (p1 p2 C)", p1=patch_size, p2=patch_size
-    )
+    B, C, H, W = imgs.shape
+    assert H % patch_size == 0 and W % patch_size == 0
+    h = H // patch_size
+    w = W // patch_size
+    x = imgs.reshape(B, C, h, patch_size, w, patch_size)
+    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    x = x.view(B, h * w, patch_size * patch_size * C)
+    return x
 
 
 def unpatchify(x, channels, patch_size, h, w):
-    return einops.rearrange(
-        x,
-        "B (h w) (p1 p2 C) -> B C (h p1) (w p2)",
-        h=h, w=w, p1=patch_size, p2=patch_size, C=channels,
-    )
+    B = x.shape[0]
+    x = x.view(B, h, w, patch_size, patch_size, channels)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+    x = x.view(B, channels, h * patch_size, w * patch_size)
+    return x
 
 
 class PatchEmbed(nn.Module):
@@ -96,16 +101,18 @@ class SelfAttention(nn.Module):
         k = self.to_k(x)
         v = self.to_v(x)
 
-        q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=self.num_heads)
-        k = einops.rearrange(k, "B L (H D) -> (B H) L D", H=self.num_heads)
-        v = einops.rearrange(v, "B L (H D) -> (B H) L D", H=self.num_heads)
+        D = self.head_dim
+        H = self.num_heads
+        q = q.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
+        k = k.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
+        v = v.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         out = attn @ v
-        out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=self.num_heads)
+        out = out.view(B, self.num_heads, L, D).permute(0, 2, 1, 3).contiguous().view(B, L, self.num_heads * D)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
@@ -140,16 +147,18 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=self.num_heads)
-        k = einops.rearrange(k, "B S (H D) -> (B H) S D", H=self.num_heads)
-        v = einops.rearrange(v, "B S (H D) -> (B H) S D", H=self.num_heads)
+        D = self.head_dim
+        H = self.num_heads
+        q = q.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
+        k = k.view(B, k.shape[1], H, D).permute(0, 2, 1, 3).contiguous().view(B * H, k.shape[1], D)
+        v = v.view(B, v.shape[1], H, D).permute(0, 2, 1, 3).contiguous().view(B * H, v.shape[1], D)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         out = attn @ v
-        out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=self.num_heads)
+        out = out.view(B, self.num_heads, L, D).permute(0, 2, 1, 3).contiguous().view(B, L, self.num_heads * D)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
