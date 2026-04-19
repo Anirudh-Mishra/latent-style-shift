@@ -22,6 +22,42 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from uvit_backbone import UViTBackbone, UVIT_CONFIGS
 
 
+def prepare_coco_mapping(coco_json_path: str, images_dir: str, out_dir: str):
+    """Create a mapping_file.json for train_uvit from COCO captions JSON.
+
+    mapping entries will contain absolute paths to images (no copying).
+    """
+    coco_json_path = Path(coco_json_path)
+    images_dir = Path(images_dir)
+    out_dir = Path(out_dir)
+    if not coco_json_path.exists():
+        raise FileNotFoundError(f"COCO annotations not found: {coco_json_path}")
+    with open(coco_json_path) as f:
+        coco = json.load(f)
+
+    # build id -> filename
+    id2fname = {img["id"]: img["file_name"] for img in coco.get("images", [])}
+    # choose one caption per image (first encountered)
+    mapping = {}
+    for ann in coco.get("annotations", []):
+        img_id = ann.get("image_id")
+        fname = id2fname.get(img_id)
+        if fname is None:
+            continue
+        if fname not in mapping:
+            img_path = images_dir / fname
+            mapping[fname] = {
+                "image_path": str(img_path.resolve()),
+                "editing_instruction": ann.get("caption", ""),
+            }
+
+    out_path = out_dir / "mapping_file.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(mapping, f, indent=2)
+    print(f"Wrote COCO mapping to {out_path} with {len(mapping)} entries")
+
+
 class ImageTextDataset(Dataset):
     def __init__(self, data_dir, image_size=512, tokenizer=None, max_length=77):
         self.data_dir = Path(data_dir)
@@ -36,13 +72,29 @@ class ImageTextDataset(Dataset):
                 metadata = json.load(f)
             if isinstance(metadata, list):
                 for entry in metadata:
-                    img_path = self.data_dir / "annotation_images" /entry["image_path"]
+                    # support either relative paths (under annotation_images) or absolute paths
+                    rel_path = self.data_dir / "annotation_images" / entry.get("image_path", "")
+                    if rel_path.exists():
+                        img_path = rel_path
+                    else:
+                        # try entry image_path as absolute or relative to data_dir
+                        img_path_candidate = Path(entry.get("image_path", ""))
+                        if not img_path_candidate.is_absolute():
+                            img_path_candidate = self.data_dir / entry.get("image_path", "")
+                        img_path = img_path_candidate
                     if img_path.exists():
-                        self.pairs.append((str(img_path), entry["text"]))
+                        self.pairs.append((str(img_path), entry.get("text", "")))
             elif isinstance(metadata, dict):
                 for fname, dict_data in metadata.items():
-                    img_path = self.data_dir / "annotation_images" / dict_data["image_path"]
-                    text = dict_data["editing_instruction"]
+                    rel_path = self.data_dir / "annotation_images" / dict_data.get("image_path", "")
+                    if rel_path.exists():
+                        img_path = rel_path
+                    else:
+                        img_path_candidate = Path(dict_data.get("image_path", ""))
+                        if not img_path_candidate.is_absolute():
+                            img_path_candidate = self.data_dir / dict_data.get("image_path", "")
+                        img_path = img_path_candidate
+                    text = dict_data.get("editing_instruction", dict_data.get("text", ""))
                     if img_path.exists():
                         self.pairs.append((str(img_path), text))
         else:
@@ -56,14 +108,14 @@ class ImageTextDataset(Dataset):
                     self.pairs.append((str(img_path), caption))
 
         if len(self.pairs) == 0:
-            raise ValueError(f"No image-text pairs found in {img_path}")
+            raise ValueError(f"No image-text pairs found in {self.data_dir}")
         print(f"Found {len(self.pairs)} image-text pairs")
 
         self.transform = transforms.Compose([
             transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
 
     def __len__(self):
@@ -130,9 +182,8 @@ def train(args):
     )
     
     if args.resume:
-        print(f"Resuming from {args.resume}")
-        state_dict = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(state_dict, strict=False)
+        resume_path = args.resume
+        print(f"Will resume from {resume_path} if checkpoint dict contains optimizer/state info")
     
     model = model.to(device, dtype=dtype)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -184,15 +235,46 @@ def train(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Resume support: load optimizer, lr_scheduler, scaler, and training state if available
+    start_epoch = 0
+    global_step = 0
+    best_loss = float("inf")
+    if args.resume:
+        ckpt_path = resume_path
+        if os.path.exists(ckpt_path):
+            print(f"Loading checkpoint {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(ckpt.get("model", {}), strict=False)
+            opt_state = ckpt.get("optimizer", None)
+            if opt_state is not None:
+                try:
+                    optimizer.load_state_dict(opt_state)
+                except Exception:
+                    print("Warning: failed to fully load optimizer state; continuing with fresh optimizer")
+            lr_state = ckpt.get("lr_scheduler", None)
+            if lr_state is not None:
+                try:
+                    lr_scheduler.load_state_dict(lr_state)
+                except Exception:
+                    print("Warning: failed to load lr_scheduler state")
+            if args.use_amp and "scaler" in ckpt and ckpt.get("scaler") is not None:
+                try:
+                    scaler.load_state_dict(ckpt.get("scaler"))
+                except Exception:
+                    print("Warning: failed to load AMP scaler state")
+            global_step = ckpt.get("global_step", 0)
+            start_epoch = ckpt.get("epoch", 0)
+            best_loss = ckpt.get("best_loss", best_loss)
+            print(f"Resuming from epoch {start_epoch}, global_step {global_step}")
+        else:
+            print(f"Resume path {ckpt_path} not found; starting fresh training")
+
     print(f"\nStarting training for {args.num_epochs} epochs ({total_steps} steps)")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Learning rate: {args.lr}")
     print(f"  Output: {args.output_dir}\n")
 
-    global_step = 0
-    best_loss = float("inf")
-
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         epoch_loss = 0.0
         t0 = time.time()
@@ -220,24 +302,28 @@ def train(args):
                 with torch.cuda.amp.autocast():
                     noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
                     loss = F.mse_loss(noise_pred, noise)
-                optimizer.zero_grad()
+                loss = loss / args.grad_accum_steps
                 scaler.scale(loss).backward()
-                if args.max_grad_norm > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                lr_scheduler.step()
+                # optimizer step every grad_accum_steps
+                if (batch_idx + 1) % args.grad_accum_steps == 0:
+                    if args.max_grad_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
             else:
                 noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
                 loss = F.mse_loss(noise_pred, noise)
-
-                optimizer.zero_grad()
+                loss = loss / args.grad_accum_steps
                 loss.backward()
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
+                if (batch_idx + 1) % args.grad_accum_steps == 0:
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
 
             epoch_loss += loss.item()
             global_step += 1
@@ -246,20 +332,40 @@ def train(args):
                 avg = epoch_loss / (batch_idx + 1)
                 lr = optimizer.param_groups[0]["lr"]
                 print(f"  [Step {global_step}] loss={loss.item():.4f}  avg={avg:.4f}  lr={lr:.2e}")
+            global_step += 1
 
         epoch_loss /= len(dataloader)
         elapsed = time.time() - t0
         print(f"\nEpoch {epoch + 1}/{args.num_epochs}  loss={epoch_loss:.4f}  time={elapsed:.1f}s")
 
+        # Save full checkpoint (model + optimizer + scheduler + scaler + metadata)
         if (epoch + 1) % args.save_every == 0 or epoch_loss < best_loss:
             ckpt_path = os.path.join(args.output_dir, f"uvit_{args.uvit_size}_epoch{epoch + 1}.pt")
-            torch.save(model.state_dict(), ckpt_path)
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "global_step": global_step,
+                "epoch": epoch + 1,
+                "best_loss": best_loss,
+            }
+            torch.save(ckpt, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
             best_path = os.path.join(args.output_dir, f"uvit_{args.uvit_size}_best.pt")
-            torch.save(model.state_dict(), best_path)
+            best_ckpt = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "global_step": global_step,
+                "epoch": epoch + 1,
+                "best_loss": best_loss,
+            }
+            torch.save(best_ckpt, best_path)
             print(f"New best model: {best_path}")
 
         # always save metadata for this epoch
@@ -292,6 +398,8 @@ if __name__ == "__main__":
     parser.add_argument("--patch_size", type=int, default=2)
     parser.add_argument("--resume", type=str, default=None)
 
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Number of steps to accumulate gradients before optimizer step")
+
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--use_amp", action="store_true", help="Use mixed precision (AMP)")
     parser.add_argument("--freeze_vae", dest="freeze_vae", action="store_true", help="Freeze pretrained VAE")
@@ -311,6 +419,23 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./uvit_checkpoints")
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--save_every", type=int, default=5)
+    parser.add_argument("--coco_annotations", type=str, default=None,
+                        help="Path to COCO captions JSON; when set, a mapping_file.json will be generated in --data_dir")
+    parser.add_argument("--coco_images_dir", type=str, default=None,
+                        help="Path to COCO images (train2017). If not set, will look in parent folder of annotations for 'train2017'.")
 
     args = parser.parse_args()
+    # If provided, prepare mapping from COCO annotations
+    if args.coco_annotations is not None:
+        images_dir = args.coco_images_dir
+        if images_dir is None:
+            # try to infer
+            annp = Path(args.coco_annotations)
+            cand = annp.parent.parent / "train2017"
+            if cand.exists():
+                images_dir = str(cand)
+            else:
+                raise ValueError("--coco_images_dir must be provided or train2017 must be next to annotations")
+        prepare_coco_mapping(args.coco_annotations, images_dir, args.data_dir)
+
     train(args)

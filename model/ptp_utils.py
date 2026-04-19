@@ -89,8 +89,9 @@ def register_attention_control(model, controller):
             hidden_states = torch.bmm(attention_probs, v)
             hidden_states = attn.batch_to_head_dim(hidden_states)
 
-            # linear proj   
-            hidden_states = attn.to_out[0](hidden_states, scale=scale)
+            # linear proj
+            # Some Linear modules don't accept a `scale` kwarg; apply scaling to output instead.
+            hidden_states = attn.to_out[0](hidden_states) * scale
             # dropout
             hidden_states = attn.to_out[1](hidden_states)
 

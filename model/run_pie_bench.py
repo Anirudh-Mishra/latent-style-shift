@@ -42,7 +42,8 @@ if _backbone == "uvit":
     from uvit_adapter import create_uvit_adapter
     uvit_adapter = create_uvit_adapter(preset=_uvit_size)
     if _uvit_checkpoint:
-        state_dict = torch.load(_uvit_checkpoint, map_location="cpu")
+        raw = torch.load(_uvit_checkpoint, map_location="cpu")
+        state_dict = raw.get('model', raw)
         uvit_adapter.backbone.load_state_dict(state_dict, strict=False)
     uvit_adapter = uvit_adapter.to(dtype=torch_dtype)
     pipe.unet = uvit_adapter
