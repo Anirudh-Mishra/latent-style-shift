@@ -3,16 +3,16 @@
 # 1. Load the Anaconda module
 module load anaconda3
 
-# 2. Initialize Conda for the script and activate your specific environment
-conda deactivate  # Ensures we exit the base environment first
+# 2. Initialize Conda for the script
+conda deactivate
 conda activate /ocean/projects/cis260127p/shared/UNetENV
 
 # 3. Handle the Data (Unzip to /$LOCAl)
 echo "Getting data to /local/data..."
 mkdir -p $LOCAL/data/ && cd $LOCAL/data/
-mkdir -p $LOCAL/data/train2017 $LOCAL/data/val2017 $LOCAL/data/annotations
-unzip -oq /ocean/projects/cis260127p/shared/data/Project/train2017.zip -d $LOCAL/data/train2017
-unzip -oq /ocean/projects/cis260127p/shared/data/Project/val2017.zip   -d $LOCAL/data/val2017
+mkdir -p $LOCAL/data/annotations
+unzip -oq /ocean/projects/cis260127p/shared/data/Project/train2017.zip -d $LOCAL/data
+unzip -oq /ocean/projects/cis260127p/shared/data/Project/val2017.zip   -d $LOCAL/data
 cp /ocean/projects/cis260127p/shared/data/Project/annotations/captions_train2017.json $LOCAL/data/annotations/
 cp /ocean/projects/cis260127p/shared/data/Project/annotations/captions_val2017.json   $LOCAL/data/annotations/
 
