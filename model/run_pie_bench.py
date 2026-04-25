@@ -448,14 +448,36 @@ def main():
 
     if args.backbone == "uvit":
         from uvit_adapter import create_uvit_adapter, register_attention_control as uvit_register, has_attention_processors
-        _adapter = create_uvit_adapter(
-            preset=args.uvit_size,
-            patch_size=args.uvit_patch_size,
-            source_conditioned=args.source_conditioned,
-        )
+        
+        # If checkpoint provided, infer model size from it
+        uvit_overrides = {
+            'patch_size': args.uvit_patch_size,
+            'source_conditioned': args.source_conditioned,
+        }
+        
         if args.uvit_checkpoint:
             raw = torch.load(args.uvit_checkpoint, map_location="cpu")
             state_dict = raw.get("model", raw.get("model_state_dict", raw))
+            
+            # Infer embed_dim from checkpoint
+            if 'in_blocks.0.norm1.weight' in state_dict:
+                embed_dim = state_dict['in_blocks.0.norm1.weight'].shape[0]
+                print(f"Detected embed_dim={embed_dim} from checkpoint")
+                uvit_overrides['embed_dim'] = embed_dim
+            
+            # Infer depth from checkpoint
+            num_in_blocks = sum(1 for k in state_dict.keys() if k.startswith('in_blocks.') and '.norm1.weight' in k)
+            num_out_blocks = sum(1 for k in state_dict.keys() if k.startswith('out_blocks.') and '.norm1.weight' in k)
+            depth = num_in_blocks + 1 + num_out_blocks  # in + mid + out
+            print(f"Detected depth={depth} from checkpoint")
+            uvit_overrides['depth'] = depth
+        
+        _adapter = create_uvit_adapter(
+            preset=args.uvit_size,
+            **uvit_overrides
+        )
+        
+        if args.uvit_checkpoint:
             missing, unexpected = _adapter.backbone.load_state_dict(state_dict, strict=False)
             print(f"Loaded UViT checkpoint from {args.uvit_checkpoint}")
             if missing:

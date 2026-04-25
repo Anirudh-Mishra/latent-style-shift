@@ -58,42 +58,6 @@ def prepare_coco_mapping(coco_json_path: str, images_dir: str, out_dir: str):
     print(f"Wrote COCO mapping to {out_path} with {len(mapping)} entries")
 
 
-def prepare_coco_mapping(coco_json_path: str, images_dir: str, out_dir: str):
-    """Create a mapping_file.json for train_uvit from COCO captions JSON.
-
-    mapping entries will contain absolute paths to images (no copying).
-    """
-    coco_json_path = Path(coco_json_path)
-    images_dir = Path(images_dir)
-    out_dir = Path(out_dir)
-    if not coco_json_path.exists():
-        raise FileNotFoundError(f"COCO annotations not found: {coco_json_path}")
-    with open(coco_json_path) as f:
-        coco = json.load(f)
-
-    # build id -> filename
-    id2fname = {img["id"]: img["file_name"] for img in coco.get("images", [])}
-    # choose one caption per image (first encountered)
-    mapping = {}
-    for ann in coco.get("annotations", []):
-        img_id = ann.get("image_id")
-        fname = id2fname.get(img_id)
-        if fname is None:
-            continue
-        if fname not in mapping:
-            img_path = images_dir / fname
-            mapping[fname] = {
-                "image_path": str(img_path.resolve()),
-                "editing_instruction": ann.get("caption", ""),
-            }
-
-    out_path = out_dir / "mapping_file.json"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(mapping, f, indent=2)
-    print(f"Wrote COCO mapping to {out_path} with {len(mapping)} entries")
-
-
 class ImageTextDataset(Dataset):
     def __init__(self, data_dir, image_size=512, tokenizer=None, max_length=77):
         self.data_dir = Path(data_dir)
@@ -440,12 +404,6 @@ def train(args):
                 loss_value = loss.item()  # record true loss before division
                 loss = loss / args.grad_accum_steps
                 loss.backward()
-                if (batch_idx + 1) % args.grad_accum_steps == 0:
-                    if args.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    lr_scheduler.step()
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
                     if args.max_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
