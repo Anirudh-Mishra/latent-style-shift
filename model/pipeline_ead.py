@@ -633,11 +633,19 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                         dim=0,
                     )
 
+                # For source-conditioned UViT backbones the clean source latent
+                # is concatenated channel-wise inside UViTBackbone.forward().
+                # Expand clean_latents to match the stacked batch dimension
+                # (3 streams × CFG factor).  The UNet path ignores this kwarg.
+                _n_repeats = concat_latent_model_input.shape[0] // latents.shape[0]
+                _source_latent_expanded = clean_latents.repeat(_n_repeats, 1, 1, 1)
+
                 concat_noise_pred = self.unet(
                     concat_latent_model_input,
                     t,
                     cross_attention_kwargs=cross_attention_kwargs,
                     encoder_hidden_states=concat_prompt_embeds,
+                    source_latent=_source_latent_expanded,
                 ).sample
 
                 # perform guidance

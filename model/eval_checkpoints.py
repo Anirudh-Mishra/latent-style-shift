@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--results_dir', type=str, default='results')
     parser.add_argument('--python', type=str, default=sys.executable)
     parser.add_argument('--uvit_size', type=str, default='mid')
+    parser.add_argument('--source_conditioned', action='store_true',
+                        help='Forward --source_conditioned to run_uvit_inference.py')
     parser.add_argument('--infer_script', type=str, default=os.path.join('model','run_uvit_inference.py'))
     parser.add_argument('--eval_script', type=str, default=os.path.join('eval','evaluation','evaluate.py'))
     args = parser.parse_args()
@@ -43,6 +45,8 @@ def main():
         # run inference wrapper
         cmd_inf = [args.python, args.infer_script, '--checkpoint', ckpt, '--uvit_size', args.uvit_size,
                    '--source_path', args.data_dir, '--target_path', out_dir]
+        if args.source_conditioned:
+            cmd_inf.append('--source_conditioned')
         r = subprocess.run(cmd_inf)
         if r.returncode != 0:
             print('Inference failed for', ckpt)

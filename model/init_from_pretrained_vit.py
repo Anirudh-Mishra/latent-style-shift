@@ -32,8 +32,6 @@ def resize_pos_embed(src, dst_num_patches, embed_dim):
         raise ValueError(f'pos_embed token count {N} is not a square')
     D = int(math.sqrt(dst_num_patches))
     src_grid = src_tok.reshape(1, S, S, embed_dim).permute(0, 3, 1, 2)  # (1,C,S,S)
-    D = int(math.sqrt(dst_num_patches))
-    src_grid = src_tok.reshape(1, S, S, embed_dim).permute(0, 3, 1, 2)  # (1,C,S,S)
     # interpolate to (1,C,D,D)
     resized = F.interpolate(src_grid, size=(D, D), mode='bicubic', align_corners=False)
     resized = resized.permute(0, 2, 3, 1).reshape(1, D * D, embed_dim)
@@ -70,14 +68,14 @@ def map_block_from_mae(src, dst):
     if f"attn.proj.bias" in src and dst.self_attn.proj.bias is not None:
         dst.self_attn.proj.bias.data.copy_(src[f"attn.proj.bias"]) 
 
-    # norm2 -> map to norm2 and norm3 (UViT has 3 norms)
+    # norm2 gates the cross-attention sub-layer
     if f"norm2.weight" in src:
-        dst.norm2.weight.data.copy_(src[f"norm2.weight"]) if hasattr(dst.norm2, 'weight') else None
-        dst.norm2.bias.data.copy_(src[f"norm2.bias"]) if hasattr(dst.norm2, 'bias') else None
-        # also copy to norm3 when available
-        if hasattr(dst, 'norm3'):
-            dst.norm3.weight.data.copy_(src[f"norm2.weight"]) 
-            dst.norm3.bias.data.copy_(src[f"norm2.bias"]) 
+        if hasattr(dst.norm2, 'weight'):
+            dst.norm2.weight.data.copy_(src[f"norm2.weight"])
+            dst.norm2.bias.data.copy_(src[f"norm2.bias"])
+        # norm3 gates the MLP — MAE doesn't have a separate norm3, so leave it
+        # at its default initialisation (ones/zeros) rather than incorrectly
+        # copying norm2 into it.  This avoids skewing the MLP layer norm.
 
     # mlp
     if f"mlp.fc1.weight" in src:
@@ -97,6 +95,9 @@ def main():
     parser.add_argument('--img_size', type=int, default=64)
     parser.add_argument('--patch_size', type=int, default=2)
     parser.add_argument('--in_chans', type=int, default=4)
+    parser.add_argument('--source_conditioned', action='store_true',
+                        help='Create a source-conditioned backbone (patch_embed accepts 2×in_chans channels). '
+                             'Must match the flag used during training.')
     args = parser.parse_args()
 
     src_path = Path(args.source_checkpoint)
@@ -132,7 +133,7 @@ def main():
     print(f'Creating UViT with embed_dim={embed_dim}, depth={uvit_depth}')
 
     uvit = UViTBackbone(img_size=args.img_size, patch_size=args.patch_size, in_chans=args.in_chans,
-                        embed_dim=embed_dim, depth=uvit_depth)
+                        embed_dim=embed_dim, depth=uvit_depth, source_conditioned=args.source_conditioned)
 
     # map positional embedding
     if 'pos_embed' in src:
@@ -166,9 +167,10 @@ def main():
         except Exception:
             pass
 
-    # Save state dict
+    # Save state dict using the same key ("model") as train_uvit.py so that
+    # run_pie_bench.py / run_uvit_inference.py can load it without key errors.
     out_path = Path(args.out)
-    torch.save({'model_state_dict': uvit.state_dict()}, str(out_path))
+    torch.save({'model': uvit.state_dict()}, str(out_path))
     print(f'Saved mapped UViT checkpoint to {out_path}')
 
 

@@ -49,6 +49,7 @@ class PatchEmbed(nn.Module):
     def __init__(self, patch_size, in_chans=4, embed_dim=512):
         super().__init__()
         self.patch_size = patch_size
+        # in_chans may be doubled (8) when source latent is channel-concatenated
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
@@ -94,6 +95,8 @@ class SelfAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.processor = None
+        # Set by register_attention_control to route stored maps correctly
+        self._place_in_unet = "mid"
 
     def _default_forward(self, x):
         B, L, C = x.shape
@@ -107,8 +110,8 @@ class SelfAttention(nn.Module):
         k = k.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
         v = v.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        sim = (q @ k.transpose(-2, -1)) * self.scale
+        attn = sim.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         out = attn @ v
@@ -119,6 +122,8 @@ class SelfAttention(nn.Module):
 
     def forward(self, x):
         if self.processor is not None:
+            # Delegate entirely to the processor (e.g. UViTSelfAttnProcessor in ptp_utils).
+            # Convention: processor(attn_module, x) -> output tensor of shape (B, L, C).
             return self.processor(self, x)
         return self._default_forward(x)
 
@@ -139,6 +144,8 @@ class CrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.processor = None
+        # Set by register_attention_control to route stored maps correctly
+        self._place_in_unet = "mid"
 
     def _default_forward(self, x, context):
         B, L, C = x.shape
@@ -165,6 +172,8 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, context):
         if self.processor is not None:
+            # Delegate entirely to the processor (e.g. UViTCrossAttnProcessor in ptp_utils).
+            # Convention: processor(attn_module, x, context) -> output tensor of shape (B, L, C).
             return self.processor(self, x, context)
         return self._default_forward(x, context)
 
@@ -211,6 +220,7 @@ class UViTBackbone(nn.Module):
         qkv_bias=True,
         norm_layer=nn.LayerNorm,
         conv_output=True,
+        source_conditioned=False,
     ):
         super().__init__()
         self.img_size = img_size
@@ -218,8 +228,13 @@ class UViTBackbone(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
         self.depth = depth
+        self.source_conditioned = source_conditioned
 
-        self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        # When source_conditioned=True the noisy target latent and the clean
+        # source latent are concatenated channel-wise before patch embedding,
+        # doubling the input channel count.
+        patch_in_chans = in_chans * 2 if source_conditioned else in_chans
+        self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=patch_in_chans, embed_dim=embed_dim)
         self.num_patches = (img_size // patch_size) ** 2
 
         self.time_embed = nn.Sequential(
@@ -291,10 +306,18 @@ class UViTBackbone(nn.Module):
         cfg = {**UVIT_CONFIGS[preset], **overrides}
         return cls(**cfg)
 
-    def forward(self, x, timesteps, encoder_hidden_states):
+    def forward(self, x, timesteps, encoder_hidden_states, source_latent=None):
         B, C, H, W = x.shape
         h_patches = H // self.patch_size
         w_patches = W // self.patch_size
+
+        # Optionally concatenate clean source latent as extra conditioning channels
+        if self.source_conditioned:
+            if source_latent is None:
+                # Fall back to zeros if no source provided (e.g. during pure inference
+                # without source conditioning, or when called by the diffusers pipeline)
+                source_latent = torch.zeros_like(x)
+            x = torch.cat([x, source_latent], dim=1)  # (B, 2*C, H, W)
 
         x = self.patch_embed(x)
 

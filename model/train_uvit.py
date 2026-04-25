@@ -58,6 +58,42 @@ def prepare_coco_mapping(coco_json_path: str, images_dir: str, out_dir: str):
     print(f"Wrote COCO mapping to {out_path} with {len(mapping)} entries")
 
 
+def prepare_coco_mapping(coco_json_path: str, images_dir: str, out_dir: str):
+    """Create a mapping_file.json for train_uvit from COCO captions JSON.
+
+    mapping entries will contain absolute paths to images (no copying).
+    """
+    coco_json_path = Path(coco_json_path)
+    images_dir = Path(images_dir)
+    out_dir = Path(out_dir)
+    if not coco_json_path.exists():
+        raise FileNotFoundError(f"COCO annotations not found: {coco_json_path}")
+    with open(coco_json_path) as f:
+        coco = json.load(f)
+
+    # build id -> filename
+    id2fname = {img["id"]: img["file_name"] for img in coco.get("images", [])}
+    # choose one caption per image (first encountered)
+    mapping = {}
+    for ann in coco.get("annotations", []):
+        img_id = ann.get("image_id")
+        fname = id2fname.get(img_id)
+        if fname is None:
+            continue
+        if fname not in mapping:
+            img_path = images_dir / fname
+            mapping[fname] = {
+                "image_path": str(img_path.resolve()),
+                "editing_instruction": ann.get("caption", ""),
+            }
+
+    out_path = out_dir / "mapping_file.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(mapping, f, indent=2)
+    print(f"Wrote COCO mapping to {out_path} with {len(mapping)} entries")
+
+
 class ImageTextDataset(Dataset):
     def __init__(self, data_dir, image_size=512, tokenizer=None, max_length=77):
         self.data_dir = Path(data_dir)
@@ -70,45 +106,78 @@ class ImageTextDataset(Dataset):
         if metadata_path.exists():
             with open(metadata_path) as f:
                 metadata = json.load(f)
+            # Expect mapping entries to provide both a source and edited image path
+            def _first_existing_path(base: Path, entry: dict, keys: list):
+                for k in keys:
+                    if k in entry and entry[k]:
+                        p = Path(entry[k])
+                        if not p.is_absolute():
+                            p = base / entry[k]
+                        if p.exists():
+                            return str(p)
+                return None
+
             if isinstance(metadata, list):
                 for entry in metadata:
-                    # support either relative paths (under annotation_images) or absolute paths
-                    rel_path = self.data_dir / "annotation_images" / entry.get("image_path", "")
-                    if rel_path.exists():
-                        img_path = rel_path
-                    else:
-                        # try entry image_path as absolute or relative to data_dir
-                        img_path_candidate = Path(entry.get("image_path", ""))
-                        if not img_path_candidate.is_absolute():
-                            img_path_candidate = self.data_dir / entry.get("image_path", "")
-                        img_path = img_path_candidate
-                    if img_path.exists():
-                        self.pairs.append((str(img_path), entry.get("text", "")))
+                    # Entry must be a dict with source & edited image paths and text
+                    if not isinstance(entry, dict):
+                        continue
+                    src = _first_existing_path(self.data_dir, entry, ["source_image", "source", "original_image", "original_path"])
+                    edt = _first_existing_path(self.data_dir, entry, ["edited_image", "edited", "edited_image_path", "image_path"])
+                    text = entry.get("text", entry.get("editing_instruction", entry.get("editing_prompt", "")))
+                    if src is None or edt is None:
+                        # skip entries that don't contain both paths
+                        continue
+                    self.pairs.append((src, edt, text))
             elif isinstance(metadata, dict):
                 for fname, dict_data in metadata.items():
-                    rel_path = self.data_dir / "annotation_images" / dict_data.get("image_path", "")
-                    if rel_path.exists():
-                        img_path = rel_path
-                    else:
-                        img_path_candidate = Path(dict_data.get("image_path", ""))
-                        if not img_path_candidate.is_absolute():
-                            img_path_candidate = self.data_dir / dict_data.get("image_path", "")
-                        img_path = img_path_candidate
-                    text = dict_data.get("editing_instruction", dict_data.get("text", ""))
-                    if img_path.exists():
-                        self.pairs.append((str(img_path), text))
+                    if not isinstance(dict_data, dict):
+                        continue
+                    src = _first_existing_path(self.data_dir, dict_data, ["source_image", "source", "original_image", "original_path"])
+                    edt = _first_existing_path(self.data_dir, dict_data, ["edited_image", "edited", "edited_image_path", "image_path"])
+                    text = dict_data.get("editing_instruction", dict_data.get("editing_prompt", dict_data.get("text", "")))
+                    if src is None or edt is None:
+                        # If only a single image is present, skip — training requires pairs
+                        continue
+                    self.pairs.append((src, edt, text))
         else:
-            for img_path in sorted(self.data_dir.glob("*")):
-                if img_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-                    txt_path = img_path.with_suffix(".txt")
-                    if txt_path.exists():
-                        caption = txt_path.read_text().strip()
-                    else:
-                        caption = ""
-                    self.pairs.append((str(img_path), caption))
+            # Fallback: look for image pairs in the directory
+            # Expected naming: source_xxx.jpg and edited_xxx.jpg
+            img_files = sorted(self.data_dir.glob("*"))
+            source_files = [f for f in img_files if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and "source" in f.stem.lower()]
+            
+            for src_path in source_files:
+                # Try to find corresponding edited image
+                base_name = src_path.stem.replace("source_", "").replace("source", "")
+                edited_candidates = [
+                    src_path.parent / f"edited_{base_name}{src_path.suffix}",
+                    src_path.parent / f"edited{base_name}{src_path.suffix}",
+                    src_path.parent / f"{base_name}_edited{src_path.suffix}",
+                    src_path.parent / f"{base_name}edited{src_path.suffix}",
+                ]
+                
+                edt_path = None
+                for candidate in edited_candidates:
+                    if candidate.exists():
+                        edt_path = candidate
+                        break
+                
+                if edt_path is None:
+                    continue
+                
+                # Look for caption file
+                txt_path = src_path.with_suffix(".txt")
+                if txt_path.exists():
+                    caption = txt_path.read_text().strip()
+                else:
+                    # Try edited image txt
+                    txt_path = edt_path.with_suffix(".txt")
+                    caption = txt_path.read_text().strip() if txt_path.exists() else ""
+                
+                self.pairs.append((str(src_path), str(edt_path), caption))
 
         if len(self.pairs) == 0:
-            raise ValueError(f"No image-text pairs found in {self.data_dir}")
+            raise ValueError(f"No source/edited image pairs found in {self.data_dir}; mapping_file.json must contain both source and edited image paths per entry")
         print(f"Found {len(self.pairs)} image-text pairs")
 
         self.transform = transforms.Compose([
@@ -122,9 +191,11 @@ class ImageTextDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        img_path, caption = self.pairs[idx]
-        image = Image.open(img_path).convert("RGB")
-        image = self.transform(image)
+        src_path, edt_path, caption = self.pairs[idx]
+        src_image = Image.open(src_path).convert("RGB")
+        edt_image = Image.open(edt_path).convert("RGB")
+        src_image = self.transform(src_image)
+        edt_image = self.transform(edt_image)
 
         tokens = self.tokenizer(
             caption,
@@ -135,7 +206,7 @@ class ImageTextDataset(Dataset):
         )
         input_ids = tokens.input_ids.squeeze(0)
 
-        return image, input_ids
+        return src_image, edt_image, input_ids
 
 
 def train(args):
@@ -179,6 +250,7 @@ def train(args):
         patch_size=args.patch_size,
         in_chans=4,
         context_dim=768,
+        source_conditioned=args.source_conditioned,
     )
     
     if args.resume:
@@ -189,8 +261,13 @@ def train(args):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"U-ViT parameters: {num_params / 1e6:.1f}M")
 
-    scheduler = LCMScheduler.from_pretrained(model_id, subfolder="scheduler")
-    # scheduler.set_timesteps(1000, device=device)
+    # Wrap backbone in adapter so we can register UAC processors during training
+    from uvit_adapter import UViTAdapter, register_attention_control as uvit_register, unregister_attention_control as uvit_unregister
+    import ptp_utils
+    adapter = UViTAdapter(model)
+    adapter = adapter.to(device, dtype=dtype)
+
+    scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
     dataset = ImageTextDataset(
         args.data_dir,
@@ -224,6 +301,7 @@ def train(args):
 
     total_steps = len(dataloader) * args.num_epochs
     warmup_steps = min(args.warmup_steps, total_steps // 10)
+    print(f"  Effective warmup steps: {warmup_steps} (requested {args.warmup_steps})")
 
     def lr_lambda(step):
         if step < warmup_steps:
@@ -279,32 +357,75 @@ def train(args):
         epoch_loss = 0.0
         t0 = time.time()
 
-        for batch_idx, (images, input_ids) in enumerate(dataloader):
-            images = images.to(device, dtype=dtype)
+        # Clear any stale gradients left by a partial accumulation window at the
+        # end of the previous epoch so they don't bleed into this epoch's first step.
+        optimizer.zero_grad()
+
+        for batch_idx, (src_images, edt_images, input_ids) in enumerate(dataloader):
+            src_images = src_images.to(device, dtype=dtype)
+            edt_images = edt_images.to(device, dtype=dtype)
             input_ids = input_ids.to(device)
 
+            # Encode source (clean) and edited (to-be-noised) images with VAE
             with torch.no_grad():
-                latents = vae.encode(images).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                source_latents = vae.encode(src_images).latent_dist.sample()
+                source_latents = source_latents * vae.config.scaling_factor
+
+                target_latents = vae.encode(edt_images).latent_dist.sample()
+                target_latents = target_latents * vae.config.scaling_factor
 
             with torch.no_grad():
                 encoder_hidden_states = text_encoder(input_ids)[0]
 
             timesteps = torch.randint(
                 0, scheduler.config.num_train_timesteps,
-                (latents.shape[0],), device=device, dtype=torch.long,
+                (target_latents.shape[0],), device=device, dtype=torch.long,
             )
 
-            noise = torch.randn_like(latents)
-            noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+            # Noise only the target (edited) latents — the model predicts this noise
+            noise = torch.randn_like(target_latents)
+            noisy_latents = scheduler.add_noise(target_latents, noise, timesteps)
+
+            # --- Capture source attention maps using AttentionStore ---
+            attention_store = ptp_utils.AttentionStore()
+            uvit_register(adapter, attention_store)
+            attention_store.reset()
+            with torch.no_grad():
+                _ = adapter(source_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
+
+            stored_maps = attention_store.attention_store if len(attention_store.attention_store) > 0 else attention_store.step_store
+            uvit_unregister(adapter)
+
+            class StoredAttnInjector:
+                def __init__(self, store):
+                    self.store = {k: [t.detach() for t in v] for k, v in store.items()}
+                    self.ptrs = {k: 0 for k in self.store}
+
+                def __call__(self, attn, is_cross: bool, place_in_unet: str):
+                    if not is_cross:
+                        return attn
+                    key = f"{place_in_unet}_cross"
+                    lst = self.store.get(key, [])
+                    if len(lst) == 0:
+                        return attn
+                    idx = self.ptrs.get(key, 0)
+                    out = lst[min(idx, len(lst) - 1)].to(attn.device)
+                    self.ptrs[key] = min(idx + 1, len(lst) - 1)
+                    return out
+
+                def self_attn_forward(self, q, k, v, h):
+                    return q, k, v
+
+            injector = StoredAttnInjector(stored_maps)
+            uvit_register(adapter, injector)
 
             if args.use_amp:
                 with torch.cuda.amp.autocast():
-                    noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
+                    noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
                     loss = F.mse_loss(noise_pred, noise)
+                loss_value = loss.item()  # record true loss before division
                 loss = loss / args.grad_accum_steps
                 scaler.scale(loss).backward()
-                # optimizer step every grad_accum_steps
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
                     if args.max_grad_norm > 0:
                         scaler.unscale_(optimizer)
@@ -314,8 +435,9 @@ def train(args):
                     optimizer.zero_grad()
                     lr_scheduler.step()
             else:
-                noise_pred = model(noisy_latents, timesteps, encoder_hidden_states)
+                noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
                 loss = F.mse_loss(noise_pred, noise)
+                loss_value = loss.item()  # record true loss before division
                 loss = loss / args.grad_accum_steps
                 loss.backward()
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
@@ -324,15 +446,26 @@ def train(args):
                     optimizer.step()
                     optimizer.zero_grad()
                     lr_scheduler.step()
+                if (batch_idx + 1) % args.grad_accum_steps == 0:
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
 
-            epoch_loss += loss.item()
+            # Unregister injector after the forward so subsequent batches start fresh
+            try:
+                uvit_unregister(adapter)
+            except Exception:
+                pass
+
+            epoch_loss += loss_value
             global_step += 1
 
             if global_step % args.log_every == 0:
                 avg = epoch_loss / (batch_idx + 1)
                 lr = optimizer.param_groups[0]["lr"]
-                print(f"  [Step {global_step}] loss={loss.item():.4f}  avg={avg:.4f}  lr={lr:.2e}")
-            global_step += 1
+                print(f"  [Step {global_step}] loss={loss_value:.4f}  avg={avg:.4f}  lr={lr:.2e}")
 
         epoch_loss /= len(dataloader)
         elapsed = time.time() - t0
@@ -396,6 +529,9 @@ if __name__ == "__main__":
     parser.add_argument("--uvit_size", type=str, default="mid",
                         choices=["small", "mid", "large"])
     parser.add_argument("--patch_size", type=int, default=2)
+    parser.add_argument("--source_conditioned", action="store_true",
+                        help="Concatenate clean source latent as extra input channels (doubles patch embed in_chans to 8). "
+                             "Must match the flag used when the model was created.")
     parser.add_argument("--resume", type=str, default=None)
 
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Number of steps to accumulate gradients before optimizer step")

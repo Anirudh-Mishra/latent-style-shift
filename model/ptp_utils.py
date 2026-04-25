@@ -105,78 +105,15 @@ def register_attention_control(model, controller):
 
             return hidden_states
 
-    class UViTSelfAttnProcessor():
-        def __init__(self, place_in_unet):
-            self.place_in_unet = place_in_unet
-
-        def __call__(self, attn_module, x):
-            import einops
-            B, L, C = x.shape
-            h = attn_module.num_heads
-
-            q = attn_module.to_q(x)
-            k = attn_module.to_k(x)
-            v = attn_module.to_v(x)
-
-            q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=h)
-            k = einops.rearrange(k, "B L (H D) -> (B H) L D", H=h)
-            v = einops.rearrange(v, "B L (H D) -> (B H) L D", H=h)
-
-            q, k, v = controller.self_attn_forward(q, k, v, h)
-
-            # Compute attention
-            attn = (q @ k.transpose(-2, -1)) * attn_module.scale
-            attn = attn.softmax(dim=-1)
-            attn = attn_module.attn_drop(attn)
-
-            out = attn @ v
-            out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=h)
-
-            out = attn_module.proj(out)
-            out = attn_module.proj_drop(out)
-            return out
-
-    class UViTCrossAttnProcessor():
-        def __init__(self, place_in_unet):
-            self.place_in_unet = place_in_unet
-
-        def __call__(self, attn_module, x, context):
-            import einops
-            B, L, C = x.shape
-            h = attn_module.num_heads
-
-            q = attn_module.to_q(x)
-            k = attn_module.to_k(context)
-            v = attn_module.to_v(context)
-
-            q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=h)
-            k = einops.rearrange(k, "B S (H D) -> (B H) S D", H=h)
-            v = einops.rearrange(v, "B S (H D) -> (B H) S D", H=h)
-
-            attn = (q @ k.transpose(-2, -1)) * attn_module.scale
-            attn = attn.softmax(dim=-1)
-
-            attn = controller(attn, True, self.place_in_unet)
-
-            attn = attn_module.attn_drop(attn)
-            out = attn @ v
-            out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=h)
-
-            out = attn_module.proj(out)
-            out = attn_module.proj_drop(out)
-            return out
-
     def register_recr(net_, count, place_in_unet):
         for idx, m in enumerate(net_.modules()):
+            # Only hook diffusers Attention modules (U-Net).
+            # UViT SelfAttention / CrossAttention are handled by
+            # uvit_adapter.register_attention_control — skip them here to
+            # avoid double-registration and signature conflicts.
             if m.__class__.__name__ == "Attention":
-                count+=1
-                m.processor = AttnProcessor( place_in_unet)
-            elif m.__class__.__name__ == "SelfAttention":
                 count += 1
-                m.processor = UViTSelfAttnProcessor(place_in_unet)
-            elif m.__class__.__name__ == "CrossAttention":
-                count += 1
-                m.processor = UViTCrossAttnProcessor(place_in_unet)
+                m.processor = AttnProcessor(place_in_unet)
         return count
 
     cross_att_count = 0
@@ -188,6 +125,9 @@ def register_attention_control(model, controller):
             cross_att_count += register_recr(net[1], 0, "up")
         elif "mid" in net[0]:
             cross_att_count += register_recr(net[1], 0, "mid")
+        elif "backbone" in net[0]:
+            # UViT backbone — skip here; registered separately via uvit_adapter
+            pass
     controller.num_att_layers = cross_att_count
 
     

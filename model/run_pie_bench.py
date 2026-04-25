@@ -34,19 +34,8 @@ else:
     scheduler = LCMScheduler.from_config(model_id_or_path, use_auth_token=os.environ.get("USER_TOKEN"), subfolder="scheduler")
     pipe = EditPipeline.from_pretrained(model_id_or_path, use_auth_token=os.environ.get("USER_TOKEN"), scheduler=scheduler, torch_dtype=torch_dtype)
 
-_backbone = os.environ.get("BACKBONE", "unet")
-_uvit_size = os.environ.get("UVIT_SIZE", "mid")
-_uvit_checkpoint = os.environ.get("UVIT_CHECKPOINT", None)
-
-if _backbone == "uvit":
-    from uvit_adapter import create_uvit_adapter
-    uvit_adapter = create_uvit_adapter(preset=_uvit_size)
-    if _uvit_checkpoint:
-        raw = torch.load(_uvit_checkpoint, map_location="cpu")
-        state_dict = raw.get('model', raw)
-        uvit_adapter.backbone.load_state_dict(state_dict, strict=False)
-    uvit_adapter = uvit_adapter.to(dtype=torch_dtype)
-    pipe.unet = uvit_adapter
+# Runtime backbone is selected in main() from CLI args.
+_backbone = "unet"
 
 tokenizer = pipe.tokenizer
 encoder = pipe.text_encoder
@@ -92,7 +81,8 @@ class LocalBlend:
             if len(maps) == 0:
                 return x_m, x_t
             h, w = x_t.shape[2], x_t.shape[3]
-            patch_size = 2
+            # Read patch_size from the backbone rather than hardcoding
+            patch_size = pipe.unet.backbone.patch_size if hasattr(pipe.unet, 'backbone') else 2
             h_p, w_p = h // patch_size, w // patch_size
             maps = [item[:, 1:h_p*w_p+1, :].reshape(2, -1, 1, h_p, w_p, MAX_NUM_WORDS) for item in maps]
         else:
@@ -215,6 +205,10 @@ class AttentionStore(AttentionControl):
     def get_average_attention(self):
         average_attention = {key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store}
         return average_attention
+
+    def get(self, key, default=None):
+        """Get attention maps by key (e.g., 'down_cross', 'up_cross')."""
+        return self.attention_store.get(key, default)
 
     def reset(self):
         super(AttentionStore, self).reset()
@@ -357,6 +351,14 @@ def get_equalizer(text: str, word_select: Union[int, Tuple[int, ...]], values: U
     return equalizer
 
 def _has_processors_on_unet(unet):
+    # For UViT, use the dedicated has_attention_processors check which tests
+    # for non-None processors rather than just attribute existence.
+    if _backbone == "uvit":
+        try:
+            return has_attention_processors(unet)
+        except Exception:
+            return False
+    # Original U-Net check
     for m in unet.modules():
         if hasattr(m, "processor") and getattr(m, "processor") is not None:
             return True
@@ -384,6 +386,8 @@ def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, lo
                     local_blend=local_blend
                     )
     ptp_utils.register_attention_control(pipe, controller)
+    if _backbone == "uvit":
+        uvit_register(pipe.unet, controller)
 
     # sanity: ensure attention processors attached to the model (UViT or UNet)
     if not _has_processors_on_unet(pipe.unet):
@@ -433,8 +437,35 @@ def main():
     parser.add_argument('--backbone', type=str, default='unet', choices=['unet', 'uvit'])
     parser.add_argument('--uvit_size', type=str, default='mid', choices=['small', 'mid', 'large'])
     parser.add_argument('--uvit_checkpoint', type=str, default=None)
+    parser.add_argument('--uvit_patch_size', type=int, default=2, help='Patch size used by the U-ViT checkpoint')
+    parser.add_argument('--source_conditioned', action='store_true', help='Enable source-conditioned U-ViT; must match training/init')
 
     args = parser.parse_args()
+
+    # CLI is the source of truth for this run. Do not rely on BACKBONE / UVIT_* env vars.
+    global _backbone, uvit_register, has_attention_processors
+    _backbone = args.backbone
+
+    if args.backbone == "uvit":
+        from uvit_adapter import create_uvit_adapter, register_attention_control as uvit_register, has_attention_processors
+        _adapter = create_uvit_adapter(
+            preset=args.uvit_size,
+            patch_size=args.uvit_patch_size,
+            source_conditioned=args.source_conditioned,
+        )
+        if args.uvit_checkpoint:
+            raw = torch.load(args.uvit_checkpoint, map_location="cpu")
+            state_dict = raw.get("model", raw.get("model_state_dict", raw))
+            missing, unexpected = _adapter.backbone.load_state_dict(state_dict, strict=False)
+            print(f"Loaded UViT checkpoint from {args.uvit_checkpoint}")
+            if missing:
+                print(f"Warning: missing UViT checkpoint keys: {len(missing)}")
+            if unexpected:
+                print(f"Warning: unexpected UViT checkpoint keys: {len(unexpected)}")
+        _adapter = _adapter.to(dtype=torch_dtype)
+        if torch.cuda.is_available():
+            _adapter = _adapter.to("cuda")
+        pipe.unet = _adapter
 
     root = args.source_path
     target = args.target_path
