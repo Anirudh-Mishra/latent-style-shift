@@ -208,18 +208,41 @@ def train(args):
     if args.freeze_text_encoder:
         text_encoder.requires_grad_(False)
 
-    model = UViTBackbone.from_preset(
-        args.uvit_size,
-        img_size=args.latent_size,
-        patch_size=args.patch_size,
-        in_chans=4,
-        context_dim=768,
-        source_conditioned=args.source_conditioned,
-    )
+    # If resuming, detect model dimensions from checkpoint first
+    model_overrides = {
+        'img_size': args.latent_size,
+        'patch_size': args.patch_size,
+        'in_chans': 4,
+        'context_dim': 768,
+        'source_conditioned': args.source_conditioned,
+    }
     
     if args.resume:
         resume_path = args.resume
         print(f"Will resume from {resume_path} if checkpoint dict contains optimizer/state info")
+        
+        # Load checkpoint to detect dimensions
+        if os.path.exists(resume_path):
+            ckpt = torch.load(resume_path, map_location="cpu")
+            state_dict = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
+            
+            # Detect embed_dim
+            if 'in_blocks.0.norm1.weight' in state_dict:
+                embed_dim = state_dict['in_blocks.0.norm1.weight'].shape[0]
+                print(f"Detected embed_dim={embed_dim} from checkpoint")
+                model_overrides['embed_dim'] = embed_dim
+            
+            # Detect depth
+            num_in = sum(1 for k in state_dict.keys() if k.startswith('in_blocks.') and '.norm1.weight' in k)
+            num_out = sum(1 for k in state_dict.keys() if k.startswith('out_blocks.') and '.norm1.weight' in k)
+            depth = num_in + 1 + num_out
+            print(f"Detected depth={depth} from checkpoint")
+            model_overrides['depth'] = depth
+    
+    model = UViTBackbone.from_preset(
+        args.uvit_size,
+        **model_overrides
+    )
     
     model = model.to(device, dtype=dtype)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

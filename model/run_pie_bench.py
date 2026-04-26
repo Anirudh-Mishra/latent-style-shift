@@ -471,6 +471,21 @@ def main():
             depth = num_in_blocks + 1 + num_out_blocks  # in + mid + out
             print(f"Detected depth={depth} from checkpoint")
             uvit_overrides['depth'] = depth
+            
+            # Infer img_size from pos_embed and patch_size
+            if 'pos_embed' in state_dict and 'patch_embed.proj.weight' in state_dict:
+                num_patches = state_dict['pos_embed'].shape[1] - 1  # subtract time token
+                patch_size = state_dict['patch_embed.proj.weight'].shape[2]
+                import math
+                img_size = int(math.sqrt(num_patches) * patch_size)
+                print(f"Detected img_size={img_size} from checkpoint")
+                uvit_overrides['img_size'] = img_size
+            
+            # Infer in_chans from patch_embed
+            if 'patch_embed.proj.weight' in state_dict:
+                in_chans = state_dict['patch_embed.proj.weight'].shape[1]
+                print(f"Detected in_chans={in_chans} from checkpoint")
+                uvit_overrides['in_chans'] = in_chans
         
         _adapter = create_uvit_adapter(
             preset=args.uvit_size,

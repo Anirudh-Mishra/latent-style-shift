@@ -17,6 +17,74 @@ import torch
 from typing import Optional, Union, Tuple, Dict
 from PIL import Image
 
+
+class AttentionControl:
+    """Base class for attention control."""
+    
+    def step_callback(self, x_t):
+        return x_t
+    
+    def between_steps(self):
+        return
+    
+    def num_uncond_att_layers(self):
+        return 0
+    
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        raise NotImplementedError
+    
+    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+        return self.forward(attn, is_cross, place_in_unet)
+    
+    def self_attn_forward(self, q, k, v, num_heads):
+        return q, k, v
+
+
+class AttentionStore(AttentionControl):
+    """Store attention maps during forward pass."""
+    
+    @staticmethod
+    def get_empty_store():
+        return {"down_cross": [], "mid_cross": [], "up_cross": [],
+                "down_self": [],  "mid_self": [],  "up_self": []}
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+            self.step_store[key].append(attn)
+        return attn
+
+    def between_steps(self):
+        if len(self.attention_store) == 0:
+            self.attention_store = self.step_store
+        else:
+            for key in self.attention_store:
+                for i in range(len(self.attention_store[key])):
+                    self.attention_store[key][i] += self.step_store[key][i]
+        self.step_store = self.get_empty_store()
+
+    def get_average_attention(self):
+        average_attention = {key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store}
+        return average_attention
+
+    def reset(self):
+        self.cur_step = 0
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+
+    def __init__(self):
+        super(AttentionStore, self).__init__()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        self.cur_step = 0
+    
+    def get(self, key=None):
+        """Get stored attention maps."""
+        if key is None:
+            return self.attention_store
+        return self.attention_store.get(key, [])
+
+
 def save_images(images,dest, num_rows=1, offset_ratio=0.02):
     if type(images) is list:
         num_empty = len(images) % num_rows
