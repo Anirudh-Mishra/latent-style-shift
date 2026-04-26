@@ -26,6 +26,10 @@ def main():
     parser.add_argument("--thresh_e", type=float, default=0.55)
     parser.add_argument("--thresh_m", type=float, default=0.6)
     parser.add_argument("--denoise", action="store_true")
+    parser.add_argument("--guidance_t", type=float, default=7.5,
+                        help="Target guidance scale (UViT default 7.5 vs UNet default 2.3)")
+    parser.add_argument("--guidance_s", type=float, default=1.0,
+                        help="Source guidance scale")
     parser.add_argument("--source_conditioned", action="store_true",
                         help="Enable source-conditioned UViT; must match training/init")
 
@@ -52,6 +56,8 @@ def main():
         "--eta", str(args.eta),
         "--thresh_e", str(args.thresh_e),
         "--thresh_m", str(args.thresh_m),
+        "--guidance_t", str(args.guidance_t),
+        "--guidance_s", str(args.guidance_s),
     ]
     if args.denoise:
         cmd.append("--denoise")

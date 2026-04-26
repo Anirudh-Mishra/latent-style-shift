@@ -14,8 +14,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+from tqdm.auto import tqdm
 
-from diffusers import AutoencoderKL, LCMScheduler, DDPMScheduler
+from diffusers import AutoencoderKL, LCMScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -208,6 +209,18 @@ def train(args):
     if args.freeze_text_encoder:
         text_encoder.requires_grad_(False)
 
+    # Frozen teacher UNet for knowledge distillation.
+    # When --distill is set the UViT learns to match UNet predictions (which
+    # already embed strong text conditioning) rather than the raw noise vector.
+    teacher_unet = None
+    if args.distill:
+        print("Loading frozen UNet teacher for knowledge distillation...")
+        teacher_unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet", torch_dtype=dtype)
+        teacher_unet = teacher_unet.to(device)
+        teacher_unet.eval()
+        teacher_unet.requires_grad_(False)
+        print("UNet teacher loaded and frozen.")
+
     # If resuming, detect model dimensions from checkpoint first
     model_overrides = {
         'img_size': args.latent_size,
@@ -348,7 +361,14 @@ def train(args):
         # end of the previous epoch so they don't bleed into this epoch's first step.
         optimizer.zero_grad()
 
-        for batch_idx, (src_images, edt_images, input_ids) in enumerate(dataloader):
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch + 1}/{args.num_epochs}",
+            leave=True,
+            dynamic_ncols=True,
+        )
+
+        for batch_idx, (src_images, edt_images, input_ids) in enumerate(progress_bar):
             src_images = src_images.to(device, dtype=dtype)
             edt_images = edt_images.to(device, dtype=dtype)
             input_ids = input_ids.to(device)
@@ -406,10 +426,22 @@ def train(args):
             injector = StoredAttnInjector(stored_maps)
             uvit_register(adapter, injector)
 
+            # Knowledge distillation: use frozen UNet predictions as training target
+            # instead of the raw noise vector. The UNet already embeds strong
+            # text conditioning; matching its output transfers that to the UViT.
+            if teacher_unet is not None:
+                with torch.no_grad():
+                    teacher_target = teacher_unet(
+                        noisy_latents, timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                    ).sample.detach()
+            else:
+                teacher_target = noise
+
             if args.use_amp:
                 with torch.cuda.amp.autocast():
                     noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
-                    loss = F.mse_loss(noise_pred, noise)
+                    loss = F.mse_loss(noise_pred, teacher_target)
                 loss_value = loss.item()  # record true loss before division
                 loss = loss / args.grad_accum_steps
                 scaler.scale(loss).backward()
@@ -423,7 +455,7 @@ def train(args):
                     lr_scheduler.step()
             else:
                 noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
-                loss = F.mse_loss(noise_pred, noise)
+                loss = F.mse_loss(noise_pred, teacher_target)
                 loss_value = loss.item()  # record true loss before division
                 loss = loss / args.grad_accum_steps
                 loss.backward()
@@ -443,9 +475,11 @@ def train(args):
             epoch_loss += loss_value
             global_step += 1
 
+            avg = epoch_loss / (batch_idx + 1)
+            lr = optimizer.param_groups[0]["lr"]
+            progress_bar.set_postfix(loss=f"{loss_value:.4f}", avg=f"{avg:.4f}", lr=f"{lr:.2e}")
+
             if global_step % args.log_every == 0:
-                avg = epoch_loss / (batch_idx + 1)
-                lr = optimizer.param_groups[0]["lr"]
                 print(f"  [Step {global_step}] loss={loss_value:.4f}  avg={avg:.4f}  lr={lr:.2e}")
 
         epoch_loss /= len(dataloader)
@@ -513,6 +547,9 @@ if __name__ == "__main__":
     parser.add_argument("--source_conditioned", action="store_true",
                         help="Concatenate clean source latent as extra input channels (doubles patch embed in_chans to 8). "
                              "Must match the flag used when the model was created.")
+    parser.add_argument("--distill", action="store_true",
+                        help="Knowledge distillation: use frozen LCM UNet predictions as training targets "
+                             "instead of raw noise. Strongly recommended when starting from MAE init.")
     parser.add_argument("--resume", type=str, default=None)
 
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Number of steps to accumulate gradients before optimizer step")

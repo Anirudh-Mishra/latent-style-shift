@@ -199,7 +199,15 @@ class TransformerBlock(nn.Module):
         if self.skip_linear is not None and skip is not None:
             x = self.skip_linear(torch.cat([x, skip], dim=-1))
 
-        x = x + self.self_attn(self.norm1(x))
+        # self_attn may change batch dim when UAC is active (stream injection).
+        # If output has a different batch size than x, we cannot do a residual
+        # add — use the UAC output directly as the new x instead.
+        sa_out = self.self_attn(self.norm1(x))
+        if sa_out.shape[0] != x.shape[0]:
+            x = sa_out
+        else:
+            x = x + sa_out
+
         x = x + self.cross_attn(self.norm2(x), context)
         x = x + self.mlp(self.norm3(x))
 
@@ -342,7 +350,20 @@ class UViTBackbone(nn.Module):
         x = self.mid_block(x, context=encoder_hidden_states)
 
         for blk in self.out_blocks:
-            x = blk(x, context=encoder_hidden_states, skip=skips.pop())
+            skip = skips.pop()
+            # UAC may change x batch dim mid-network. Match skip and context to x.
+            if skip.shape[0] != x.shape[0]:
+                if x.shape[0] % skip.shape[0] == 0:
+                    skip = skip.repeat(x.shape[0] // skip.shape[0], 1, 1)
+                else:
+                    skip = skip[:x.shape[0]]
+            ctx = encoder_hidden_states
+            if ctx is not None and ctx.shape[0] != x.shape[0]:
+                if x.shape[0] % ctx.shape[0] == 0:
+                    ctx = ctx.repeat(x.shape[0] // ctx.shape[0], 1, 1)
+                else:
+                    ctx = ctx[:x.shape[0]]
+            x = blk(x, context=ctx, skip=skip)
 
         x = self.norm(x)
         x = self.decoder_pred(x)

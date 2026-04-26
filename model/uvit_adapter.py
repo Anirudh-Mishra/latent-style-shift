@@ -81,22 +81,27 @@ def register_attention_control(adapter: UViTAdapter, controller):
 
     def _make_self_processor(ctrl, place):
         def processor(attn_module, x):
-            import einops
             B, L, C = x.shape
             h = attn_module.num_heads
-            q = attn_module.to_q(x)
-            k = attn_module.to_k(x)
-            v = attn_module.to_v(x)
-            q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=h)
-            k = einops.rearrange(k, "B L (H D) -> (B H) L D", H=h)
-            v = einops.rearrange(v, "B L (H D) -> (B H) L D", H=h)
-            # UAC self-attention sharing
+            D = attn_module.head_dim
+            # Project and reshape to (B*h, L, D)
+            q = attn_module.to_q(x).reshape(B, L, h, D).permute(0, 2, 1, 3).reshape(B * h, L, D)
+            k = attn_module.to_k(x).reshape(B, L, h, D).permute(0, 2, 1, 3).reshape(B * h, L, D)
+            v = attn_module.to_v(x).reshape(B, L, h, D).permute(0, 2, 1, 3).reshape(B * h, L, D)
+
+            # UAC self-attention sharing — may change the batch dimension
             q, k, v = ctrl.self_attn_forward(q, k, v, h)
+
+            # Derive actual batch size AFTER UAC — do NOT reuse original B
+            # self_attn_forward can change stream count (e.g. 2 streams -> 2 streams
+            # but with source k/v injected, or rearranged row order)
+            B_out = q.shape[0] // h
+
             attn = (q @ k.transpose(-2, -1)) * attn_module.scale
             attn = attn.softmax(dim=-1)
             attn = attn_module.attn_drop(attn)
-            out = attn @ v
-            out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=h)
+            out = attn @ v  # (B_out*h, L, D)
+            out = out.reshape(B_out, h, L, D).permute(0, 2, 1, 3).reshape(B_out, L, h * D)
             out = attn_module.proj(out)
             out = attn_module.proj_drop(out)
             return out
@@ -104,22 +109,27 @@ def register_attention_control(adapter: UViTAdapter, controller):
 
     def _make_cross_processor(ctrl, place):
         def processor(attn_module, x, context):
-            import einops
             B, L, C = x.shape
             h = attn_module.num_heads
-            q = attn_module.to_q(x)
-            k = attn_module.to_k(context)
-            v = attn_module.to_v(context)
-            q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=h)
-            k = einops.rearrange(k, "B S (H D) -> (B H) S D", H=h)
-            v = einops.rearrange(v, "B S (H D) -> (B H) S D", H=h)
+            D = attn_module.head_dim
+            Lk = context.shape[1]
+
+            q = attn_module.to_q(x).reshape(B, L, h, D).permute(0, 2, 1, 3).reshape(B * h, L, D)
+            k = attn_module.to_k(context).reshape(B, Lk, h, D).permute(0, 2, 1, 3).reshape(B * h, Lk, D)
+            v = attn_module.to_v(context).reshape(B, Lk, h, D).permute(0, 2, 1, 3).reshape(B * h, Lk, D)
+
             attn = (q @ k.transpose(-2, -1)) * attn_module.scale
             attn = attn.softmax(dim=-1)
+
             # UAC cross-attention control — controller observes/modifies attn map
             attn = ctrl(attn, is_cross=True, place_in_unet=place)
             attn = attn_module.attn_drop(attn)
-            out = attn @ v
-            out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=h)
+
+            # Re-derive B_out after controller may have changed attn batch dim
+            B_out = attn.shape[0] // h
+
+            out = attn @ v  # (B_out*h, L, D)
+            out = out.reshape(B_out, h, L, D).permute(0, 2, 1, 3).reshape(B_out, L, h * D)
             out = attn_module.proj(out)
             out = attn_module.proj_drop(out)
             return out

@@ -174,10 +174,10 @@ class EmptyControl(AttentionControl):
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
         return attn
-    def self_attn_forward(self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs):
-        b = q.shape[0] // num_heads
-        out = torch.einsum("h i j, h j d -> h i d", attn, v)
-        return out
+
+    def self_attn_forward(self, q, k, v, num_heads):
+        # No UAC injection — return q/k/v unchanged so attention runs normally
+        return q, k, v
 
 
 class AttentionStore(AttentionControl):
@@ -248,8 +248,52 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         return out
     
     def self_attn_forward(self, q, k, v, num_heads):
-        if q.shape[0]//num_heads == 3:
-            if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
+        num_streams = q.shape[0] // num_heads
+        past_replace = (self.self_replace_steps <= ((self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps))
+
+        if _backbone == "uvit" and num_streams == 3:
+            # U-ViT non-CFG path: pipeline sends 3 streams [source, target, mutual].
+            # Each stream is num_heads rows.
+            q_s = q[:num_heads]           # source
+            q_t = q[num_heads:num_heads*2]  # target
+            q_m = q[num_heads*2:]           # mutual
+            k_s = k[:num_heads]
+            k_t = k[num_heads:num_heads*2]
+            k_m = k[num_heads*2:]
+            v_s = v[:num_heads]
+            v_t = v[num_heads:num_heads*2]
+            v_m = v[num_heads*2:]
+            if past_replace:
+                # Inject source structure into target and mutual streams
+                k_t = k_s
+                v_t = v_s
+                k_m = k_s
+                v_m = v_s
+            return (torch.cat([q_s, q_t, q_m]),
+                    torch.cat([k_s, k_t, k_m]),
+                    torch.cat([v_s, v_t, v_m]))
+
+        elif _backbone == "uvit" and num_streams == 6:
+            # U-ViT CFG path: 6 streams [src_unc, tgt_unc, mut_unc, src_cond, tgt_cond, mut_cond].
+            H = num_heads
+            q_su, q_tu, q_mu = q[:H], q[H:H*2], q[H*2:H*3]
+            q_sc, q_tc, q_mc = q[H*3:H*4], q[H*4:H*5], q[H*5:]
+            k_su, k_tu, k_mu = k[:H], k[H:H*2], k[H*2:H*3]
+            k_sc, k_tc, k_mc = k[H*3:H*4], k[H*4:H*5], k[H*5:]
+            v_su, v_tu, v_mu = v[:H], v[H:H*2], v[H*2:H*3]
+            v_sc, v_tc, v_mc = v[H*3:H*4], v[H*4:H*5], v[H*5:]
+            if past_replace:
+                k_tu, v_tu = k_su, v_su
+                k_mu, v_mu = k_su, v_su
+                k_tc, v_tc = k_sc, v_sc
+                k_mc, v_mc = k_sc, v_sc
+            return (torch.cat([q_su, q_tu, q_mu, q_sc, q_tc, q_mc]),
+                    torch.cat([k_su, k_tu, k_mu, k_sc, k_tc, k_mc]),
+                    torch.cat([v_su, v_tu, v_mu, v_sc, v_tc, v_mc]))
+
+        elif num_streams == 3:
+            # U-Net 3-stream path
+            if past_replace:
                 q=torch.cat([q[:num_heads*2],q[num_heads:num_heads*2]])
                 k=torch.cat([k[:num_heads*2],k[:num_heads]])
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])
@@ -257,12 +301,14 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                 q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])
                 k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])
-            return q,k,v
+            return q, k, v
+
         else:
+            # U-Net standard CFG path: 4+ streams
             qu, qc = q.chunk(2)
             ku, kc = k.chunk(2)
             vu, vc = v.chunk(2)
-            if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
+            if past_replace:
                 qu=torch.cat([qu[:num_heads*2],qu[num_heads:num_heads*2]])
                 qc=torch.cat([qc[:num_heads*2],qc[num_heads:num_heads*2]])
                 ku=torch.cat([ku[:num_heads*2],ku[:num_heads]])
@@ -276,21 +322,21 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                 kc=torch.cat([kc[:num_heads],kc[:num_heads],kc[:num_heads]])
                 vu=torch.cat([vu[:num_heads*2],vu[:num_heads]])
                 vc=torch.cat([vc[:num_heads*2],vc[:num_heads]])
-
-            return torch.cat([qu, qc], dim=0) ,torch.cat([ku, kc], dim=0), torch.cat([vu, vc], dim=0)
+            return torch.cat([qu, qc], dim=0), torch.cat([ku, kc], dim=0), torch.cat([vu, vc], dim=0)
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
-        if is_cross :
+        if is_cross:
             h = attn.shape[0] // self.batch_size
-            attn = attn.reshape(self.batch_size,h,  *attn.shape[1:])
-            attn_base, attn_repalce,attn_masa = attn[0], attn[1], attn[2]
-            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce) 
-            attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
-            if (self.cross_replace_steps >= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
+            attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
+            # Three streams: [source, target, mutual/masa] — same for UNet and UViT
+            attn_base, attn_replace, attn_masa = attn[0], attn[1], attn[2]
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_replace)
+            attn_base_store = self.replace_cross_attention(attn_base, attn_replace)
+            if (self.cross_replace_steps >= ((self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps)):
                 attn[1] = attn_replace_new
-            attn_store=torch.cat([attn_base_store,attn_replace_new])
+            attn_store = torch.cat([attn_base_store, attn_replace_new])
             attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
-            attn_store = attn_store.reshape(2 *h, *attn_store.shape[2:])
+            attn_store = attn_store.reshape(2 * h, *attn_store.shape[2:])
             super(AttentionControlEdit, self).forward(attn_store, is_cross, place_in_unet)
         return attn
 
@@ -299,7 +345,9 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                  self_replace_steps: Union[float, Tuple[float, float]],
                  local_blend: Optional[LocalBlend]):
         super(AttentionControlEdit, self).__init__()
-        self.batch_size = len(prompts)+1
+        # Pipeline always sends 3 streams: source + target + mutual (masa)
+        # This is true for both U-Net and U-ViT backends
+        self.batch_size = len(prompts) + 1
         self.self_replace_steps = self_replace_steps
         self.cross_replace_steps = cross_replace_steps
         self.num_steps=num_steps
@@ -434,6 +482,8 @@ def main():
     parser.add_argument('--thresh_m', type=float, default=0.6)
     parser.add_argument('--denoise', action='store_true', help='Run denoise mode (if not set uses denoise=False)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for inference')
+    parser.add_argument('--guidance_t', type=float, default=2.3, help='Target guidance scale (higher = stronger text-driven editing)')
+    parser.add_argument('--guidance_s', type=float, default=1.0, help='Source guidance scale')
     parser.add_argument('--backbone', type=str, default='unet', choices=['unet', 'uvit'])
     parser.add_argument('--uvit_size', type=str, default='mid', choices=['small', 'mid', 'large'])
     parser.add_argument('--uvit_checkpoint', type=str, default=None)
@@ -525,7 +575,7 @@ def main():
         else:
             local = ""
         image_out = inference(
-            source_prompt, target_prompt, "", "", local, "", 1, 2.3,
+            source_prompt, target_prompt, "", "", local, "", args.guidance_s, args.guidance_t,
             num_inference_steps=args.num_inference_steps,
             width=512, height=512, seed=args.seed, img=imagein,
             strength=args.strength,
