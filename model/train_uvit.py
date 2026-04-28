@@ -231,6 +231,10 @@ def train(args):
                 embed_dim = state_dict['in_blocks.0.norm1.weight'].shape[0]
                 print(f"Detected embed_dim={embed_dim} from checkpoint")
                 model_overrides['embed_dim'] = embed_dim
+                # Detect num_heads: ViT convention uses head_dim=64
+                num_heads = embed_dim // 64
+                print(f"Detected num_heads={num_heads} from checkpoint")
+                model_overrides['num_heads'] = num_heads
             
             # Detect depth
             num_in = sum(1 for k in state_dict.keys() if k.startswith('in_blocks.') and '.norm1.weight' in k)
@@ -369,48 +373,21 @@ def train(args):
                 (target_latents.shape[0],), device=device, dtype=torch.long,
             )
 
-            # Noise only the target (edited) latents — the model predicts this noise
             noise = torch.randn_like(target_latents)
             noisy_latents = scheduler.add_noise(target_latents, noise, timesteps)
 
-            # --- Capture source attention maps using AttentionStore ---
-            attention_store = ptp_utils.AttentionStore()
-            uvit_register(adapter, attention_store)
-            attention_store.reset()
-            with torch.no_grad():
-                _ = adapter(source_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
-
-            stored_maps = attention_store.attention_store if len(attention_store.attention_store) > 0 else attention_store.step_store
-            uvit_unregister(adapter)
-
-            class StoredAttnInjector:
-                def __init__(self, store):
-                    self.store = {k: [t.detach() for t in v] for k, v in store.items()}
-                    self.ptrs = {k: 0 for k in self.store}
-
-                def __call__(self, attn, is_cross: bool, place_in_unet: str):
-                    if not is_cross:
-                        return attn
-                    key = f"{place_in_unet}_cross"
-                    lst = self.store.get(key, [])
-                    if len(lst) == 0:
-                        return attn
-                    idx = self.ptrs.get(key, 0)
-                    out = lst[min(idx, len(lst) - 1)].to(attn.device)
-                    self.ptrs[key] = min(idx + 1, len(lst) - 1)
-                    return out
-
-                def self_attn_forward(self, q, k, v, h):
-                    return q, k, v
-
-            injector = StoredAttnInjector(stored_maps)
-            uvit_register(adapter, injector)
+            context = encoder_hidden_states
+            if args.cfg_dropout_prob > 0:
+                drop_mask = torch.rand(context.shape[0]) < args.cfg_dropout_prob
+                if drop_mask.any():
+                    context = context.clone()
+                    context[drop_mask] = 0.0
 
             if args.use_amp:
                 with torch.cuda.amp.autocast():
-                    noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
+                    noise_pred = adapter(noisy_latents, timesteps, context, source_latent=source_latents if args.source_conditioned else None).sample
                     loss = F.mse_loss(noise_pred, noise)
-                loss_value = loss.item()  # record true loss before division
+                loss_value = loss.item()
                 loss = loss / args.grad_accum_steps
                 scaler.scale(loss).backward()
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
@@ -422,7 +399,7 @@ def train(args):
                     optimizer.zero_grad()
                     lr_scheduler.step()
             else:
-                noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
+                noise_pred = adapter(noisy_latents, timesteps, context, source_latent=source_latents if args.source_conditioned else None).sample
                 loss = F.mse_loss(noise_pred, noise)
                 loss_value = loss.item()  # record true loss before division
                 loss = loss / args.grad_accum_steps
@@ -433,12 +410,6 @@ def train(args):
                     optimizer.step()
                     optimizer.zero_grad()
                     lr_scheduler.step()
-
-            # Unregister injector after the forward so subsequent batches start fresh
-            try:
-                uvit_unregister(adapter)
-            except Exception:
-                pass
 
             epoch_loss += loss_value
             global_step += 1
@@ -530,6 +501,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--cfg_dropout_prob", type=float, default=0.1)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
 

@@ -248,14 +248,21 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         return out
     
     def self_attn_forward(self, q, k, v, num_heads):
+        sa_blend = self.sa_blend_factor
         if q.shape[0]//num_heads == 3:
             if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
                 q=torch.cat([q[:num_heads*2],q[num_heads:num_heads*2]])
                 k=torch.cat([k[:num_heads*2],k[:num_heads]])
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])
             else:
-                q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])
-                k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])
+                q_src = q[:num_heads]
+                q_edit = q[num_heads:num_heads*2]
+                q_blended = sa_blend * q_src + (1 - sa_blend) * q_edit
+                q=torch.cat([q_src, q_blended, q_src])
+                k_src = k[:num_heads]
+                k_edit = k[num_heads:num_heads*2]
+                k_blended = sa_blend * k_src + (1 - sa_blend) * k_edit
+                k=torch.cat([k_src, k_blended, k_src])
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])
             return q,k,v
         else:
@@ -284,10 +291,10 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
             h = attn.shape[0] // self.batch_size
             attn = attn.reshape(self.batch_size,h,  *attn.shape[1:])
             attn_base, attn_repalce,attn_masa = attn[0], attn[1], attn[2]
-            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce) 
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce)
             attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
             if (self.cross_replace_steps >= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
-                attn[1] = attn_replace_new
+                attn[1] = self.ca_blend_factor * attn_replace_new + (1 - self.ca_blend_factor) * attn_repalce
             attn_store=torch.cat([attn_base_store,attn_replace_new])
             attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
             attn_store = attn_store.reshape(2 *h, *attn_store.shape[2:])
@@ -297,7 +304,9 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
     def __init__(self, prompts, num_steps: int,start_steps: int,
                  cross_replace_steps: Union[float, Tuple[float, float], Dict[str, Tuple[float, float]]],
                  self_replace_steps: Union[float, Tuple[float, float]],
-                 local_blend: Optional[LocalBlend]):
+                 local_blend: Optional[LocalBlend],
+                 sa_blend_factor: float = 1.0,
+                 ca_blend_factor: float = 1.0):
         super(AttentionControlEdit, self).__init__()
         self.batch_size = len(prompts)+1
         self.self_replace_steps = self_replace_steps
@@ -305,6 +314,8 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         self.num_steps=num_steps
         self.start_steps=start_steps
         self.local_blend = local_blend
+        self.sa_blend_factor = sa_blend_factor
+        self.ca_blend_factor = ca_blend_factor
 
 
 class AttentionReplace(AttentionControlEdit):
@@ -327,8 +338,10 @@ class AttentionRefine(AttentionControlEdit):
         return attn_replace
 
     def __init__(self, prompts, prompt_specifiers, num_steps: int,start_steps: int, cross_replace_steps: float, self_replace_steps: float,
-                 local_blend: Optional[LocalBlend] = None):
-        super(AttentionRefine, self).__init__(prompts, num_steps,start_steps, cross_replace_steps, self_replace_steps, local_blend)
+                 local_blend: Optional[LocalBlend] = None,
+                 sa_blend_factor: float = 1.0, ca_blend_factor: float = 1.0):
+        super(AttentionRefine, self).__init__(prompts, num_steps,start_steps, cross_replace_steps, self_replace_steps, local_blend,
+                                              sa_blend_factor=sa_blend_factor, ca_blend_factor=ca_blend_factor)
         self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(prompts, prompt_specifiers, tokenizer, encoder, device)
         self.mapper, alphas, ms = self.mapper.to(device), alphas.to(device).to(torch_dtype), ms.to(device).to(torch_dtype)
         self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1])
@@ -367,7 +380,8 @@ def _has_processors_on_unet(unet):
 
 def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, local, mutual, guidance_s, guidance_t, num_inference_steps=10,
               width=512, height=512, seed=0, img=None, strength=0.7,
-               cross_replace_steps=0.8, self_replace_steps=0.4, eta=0.1, thresh_e=0.3, thresh_m=0.3, denoise=True):
+               cross_replace_steps=0.8, self_replace_steps=0.4, eta=0.1, thresh_e=0.3, thresh_m=0.3, denoise=True,
+               edit_amplification=1.0):
 
     torch.manual_seed(seed)
     ratio = min(height / img.height, width / img.width)
@@ -376,14 +390,26 @@ def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, lo
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps*strength)
     num_start = num_inference_steps-num_denoise_num
-    # create the CAC controller.
+
+    is_uvit = _backbone == "uvit"
+    if is_uvit:
+        sa_blend = 0.3
+        ca_blend = 0.4
+        cross_replace_steps = min(cross_replace_steps, 0.4)
+        self_replace_steps = min(self_replace_steps, 0.3)
+    else:
+        sa_blend = 1.0
+        ca_blend = 1.0
+
     local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=False)
     controller = AttentionRefine([source_prompt, target_prompt],[[local, mutual]],
                     num_inference_steps,
                     num_start,
                     cross_replace_steps=cross_replace_steps,
                     self_replace_steps=self_replace_steps,
-                    local_blend=local_blend
+                    local_blend=local_blend,
+                    sa_blend_factor=sa_blend,
+                    ca_blend_factor=ca_blend,
                     )
     ptp_utils.register_attention_control(pipe, controller)
     if _backbone == "uvit":
@@ -404,7 +430,8 @@ def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, lo
                    guidance_scale=guidance_t,
                    source_guidance_scale=guidance_s,
                    denoise_model=denoise,
-                   callback = controller.step_callback
+                   callback = controller.step_callback,
+                   edit_amplification=edit_amplification,
                    )
 
     return results.images[0]
@@ -432,6 +459,8 @@ def main():
     parser.add_argument('--eta', type=float, default=1.0)
     parser.add_argument('--thresh_e', type=float, default=0.55)
     parser.add_argument('--thresh_m', type=float, default=0.6)
+    parser.add_argument('--guidance_s', type=float, default=1.0, help='Source guidance scale')
+    parser.add_argument('--guidance_t', type=float, default=2.3, help='Target guidance scale (higher = stronger edits)')
     parser.add_argument('--denoise', action='store_true', help='Run denoise mode (if not set uses denoise=False)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for inference')
     parser.add_argument('--backbone', type=str, default='unet', choices=['unet', 'uvit'])
@@ -439,6 +468,7 @@ def main():
     parser.add_argument('--uvit_checkpoint', type=str, default=None)
     parser.add_argument('--uvit_patch_size', type=int, default=2, help='Patch size used by the U-ViT checkpoint')
     parser.add_argument('--source_conditioned', action='store_true', help='Enable source-conditioned U-ViT; must match training/init')
+    parser.add_argument('--edit_amplification', type=float, default=1.0)
 
     args = parser.parse_args()
 
@@ -464,6 +494,10 @@ def main():
                 embed_dim = state_dict['in_blocks.0.norm1.weight'].shape[0]
                 print(f"Detected embed_dim={embed_dim} from checkpoint")
                 uvit_overrides['embed_dim'] = embed_dim
+                # Detect num_heads: ViT convention uses head_dim=64
+                num_heads = embed_dim // 64
+                print(f"Detected num_heads={num_heads} from checkpoint")
+                uvit_overrides['num_heads'] = num_heads
             
             # Infer depth from checkpoint
             num_in_blocks = sum(1 for k in state_dict.keys() if k.startswith('in_blocks.') and '.norm1.weight' in k)
@@ -472,20 +506,22 @@ def main():
             print(f"Detected depth={depth} from checkpoint")
             uvit_overrides['depth'] = depth
             
-            # Infer img_size from pos_embed and patch_size
-            if 'pos_embed' in state_dict and 'patch_embed.proj.weight' in state_dict:
-                num_patches = state_dict['pos_embed'].shape[1] - 1  # subtract time token
-                patch_size = state_dict['patch_embed.proj.weight'].shape[2]
-                import math
-                img_size = int(math.sqrt(num_patches) * patch_size)
-                print(f"Detected img_size={img_size} from checkpoint")
-                uvit_overrides['img_size'] = img_size
-            
-            # Infer in_chans from patch_embed
+            # Infer img_size and patch_size from pos_embed and patch_embed
             if 'patch_embed.proj.weight' in state_dict:
+                patch_size = state_dict['patch_embed.proj.weight'].shape[2]
+                print(f"Detected patch_size={patch_size} from checkpoint")
+                uvit_overrides['patch_size'] = patch_size
+
                 in_chans = state_dict['patch_embed.proj.weight'].shape[1]
                 print(f"Detected in_chans={in_chans} from checkpoint")
                 uvit_overrides['in_chans'] = in_chans
+
+            if 'pos_embed' in state_dict and 'patch_embed.proj.weight' in state_dict:
+                num_patches = state_dict['pos_embed'].shape[1] - 1  # subtract time token
+                import math
+                img_size = int(math.sqrt(num_patches) * uvit_overrides.get('patch_size', args.uvit_patch_size))
+                print(f"Detected img_size={img_size} from checkpoint")
+                uvit_overrides['img_size'] = img_size
         
         _adapter = create_uvit_adapter(
             preset=args.uvit_size,
@@ -503,6 +539,7 @@ def main():
         if torch.cuda.is_available():
             _adapter = _adapter.to("cuda")
         pipe.unet = _adapter
+        pipe.safety_checker = None
 
     root = args.source_path
     target = args.target_path
@@ -525,7 +562,7 @@ def main():
         else:
             local = ""
         image_out = inference(
-            source_prompt, target_prompt, "", "", local, "", 1, 2.3,
+            source_prompt, target_prompt, "", "", local, "", args.guidance_s, args.guidance_t,
             num_inference_steps=args.num_inference_steps,
             width=512, height=512, seed=args.seed, img=imagein,
             strength=args.strength,
@@ -534,7 +571,8 @@ def main():
             eta=args.eta,
             thresh_e=args.thresh_e,
             thresh_m=args.thresh_m,
-            denoise=args.denoise)
+            denoise=args.denoise,
+            edit_amplification=args.edit_amplification)
         annotation_dir = os.path.dirname(annotation["image_path"])
 
         # Create the full directory path

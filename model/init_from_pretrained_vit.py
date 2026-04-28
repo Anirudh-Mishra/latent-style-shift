@@ -123,17 +123,28 @@ def main():
     # collect MAE blocks count
     block_keys = [k for k in src.keys() if k.startswith('blocks.') and k.endswith('norm1.weight')]
     num_mae_blocks = len(block_keys)
-    print(f'Found embed_dim={embed_dim}, num_mae_blocks={num_mae_blocks}')
+
+    # detect num_heads from the first block's attention QKV weight
+    # MAE stores fused QKV as (3*embed_dim, embed_dim); the per-head dim
+    # is typically 64, so num_heads = embed_dim // 64.
+    num_heads = embed_dim // 64  # default assumption (ViT convention)
+    qkv_key = 'blocks.0.attn.qkv.weight'
+    if qkv_key in src:
+        # qkv weight shape: (3*embed_dim, embed_dim)
+        # We can also verify: num_heads = embed_dim / head_dim where head_dim=64
+        num_heads = embed_dim // 64
+    print(f'Found embed_dim={embed_dim}, num_mae_blocks={num_mae_blocks}, num_heads={num_heads}')
 
     # choose uvit depth: prefer odd depth close to num_mae_blocks
     if num_mae_blocks % 2 == 1:
         uvit_depth = num_mae_blocks
     else:
         uvit_depth = num_mae_blocks - 1
-    print(f'Creating UViT with embed_dim={embed_dim}, depth={uvit_depth}')
+    print(f'Creating UViT with embed_dim={embed_dim}, depth={uvit_depth}, num_heads={num_heads}')
 
     uvit = UViTBackbone(img_size=args.img_size, patch_size=args.patch_size, in_chans=args.in_chans,
-                        embed_dim=embed_dim, depth=uvit_depth, source_conditioned=args.source_conditioned)
+                        embed_dim=embed_dim, depth=uvit_depth, num_heads=num_heads,
+                        source_conditioned=args.source_conditioned)
 
     # map positional embedding
     if 'pos_embed' in src:

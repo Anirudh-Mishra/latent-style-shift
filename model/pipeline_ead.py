@@ -516,6 +516,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         denoise_model: Optional[bool] = True,
+        edit_amplification: Optional[float] = 1.0,
     ):
         # 1. Check inputs
         self.check_inputs(prompt, strength, callback_steps)
@@ -669,6 +670,12 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
                 else:
                     (source_noise_pred, noise_pred, mutual_noise_pred) = concat_noise_pred.chunk(3, dim=0)
+
+                if edit_amplification != 1.0:
+                    edit_delta = noise_pred - source_noise_pred
+                    noise_pred = source_noise_pred + edit_amplification * edit_delta
+                    mutual_delta = mutual_noise_pred - source_noise_pred
+                    mutual_noise_pred = source_noise_pred + edit_amplification * mutual_delta
 
                 noise = torch.randn(
                     latents.shape, dtype=latents.dtype, device=latents.device, generator=generator

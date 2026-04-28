@@ -275,12 +275,28 @@ class UViTBackbone(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.patch_dim = patch_size ** 2 * in_chans
         self.decoder_pred = nn.Linear(embed_dim, self.patch_dim, bias=True)
-        self.final_layer = (
-            nn.Conv2d(in_chans, in_chans, 3, padding=1) if conv_output else nn.Identity()
-        )
+
+        # Convolutional output refinement — smooths patch boundary artifacts
+        # that arise from independently predicted per-patch outputs.
+        # This is critical: without it each patch is predicted independently
+        # and the unpatchified result shows a visible grid at every boundary.
+        if conv_output:
+            self.final_layer = nn.Sequential(
+                nn.Conv2d(in_chans, in_chans, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(in_chans, in_chans, 3, padding=1),
+            )
+        else:
+            self.final_layer = nn.Identity()
 
         self._init_pos_embed()
         self.apply(self._init_weights)
+
+        # Zero-initialize decoder_pred so the model starts by predicting ~zero
+        # noise rather than random noise — a much safer training starting point.
+        with torch.no_grad():
+            nn.init.zeros_(self.decoder_pred.weight)
+            nn.init.zeros_(self.decoder_pred.bias)
 
     def _init_pos_embed(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -350,6 +366,18 @@ class UViTBackbone(nn.Module):
         x = x[:, self.extras:, :]
         x = unpatchify(x, self.in_chans, self.patch_size, h_patches, w_patches)
 
+        x = self._smooth_patches(x)
         x = self.final_layer(x)
 
         return x
+
+    def _smooth_patches(self, x):
+        k = 3
+        sigma = 0.8
+        ax = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
+        kernel_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        C = x.shape[1]
+        weight = kernel_2d.unsqueeze(0).unsqueeze(0).expand(C, 1, k, k)
+        return F.conv2d(x, weight, padding=k // 2, groups=C)

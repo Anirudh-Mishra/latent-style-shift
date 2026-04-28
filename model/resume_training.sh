@@ -1,6 +1,11 @@
 #!/bin/bash
 #
 # Smart resume script - automatically finds latest checkpoint
+# Safe to run multiple times if PSC disconnects (8hr limit)
+#
+# USAGE:
+#   First run:   starts from MAE init checkpoint
+#   Later runs:  auto-detects the latest epoch checkpoint and resumes
 #
 
 OUTPUT_DIR="./checkpoints/uvit_trained_50k"
@@ -9,6 +14,7 @@ INITIAL_CHECKPOINT="./checkpoints/uvit_from_mae.pt"
 # Find the latest checkpoint
 if [ -f "$OUTPUT_DIR/uvit_mid_epoch5.pt" ]; then
     echo "✅ Training already complete (epoch 5 found)"
+    echo "Best checkpoint: $OUTPUT_DIR/uvit_mid_best.pt"
     exit 0
 elif [ -f "$OUTPUT_DIR/uvit_mid_epoch4.pt" ]; then
     RESUME_FROM="$OUTPUT_DIR/uvit_mid_epoch4.pt"
@@ -42,9 +48,9 @@ python train_uvit.py \
   --patch_size 2 \
   --batch_size 4 \
   --num_epochs 5 \
-  --lr 1e-5 \
+  --lr 5e-5 \
   --weight_decay 0.01 \
-  --warmup_steps 1000 \
+  --warmup_steps 500 \
   --max_grad_norm 1.0 \
   --num_workers 4 \
   --output_dir "$OUTPUT_DIR" \
