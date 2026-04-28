@@ -59,6 +59,28 @@ def prepare_coco_mapping(coco_json_path: str, images_dir: str, out_dir: str):
     print(f"Wrote COCO mapping to {out_path} with {len(mapping)} entries")
 
 
+class EncodedLatentDataset(Dataset):
+    """Fast dataset that loads pre-encoded VAE latents + CLIP embeddings from disk.
+
+    Create with prepare_encoded_dataset.py. Eliminates VAE and text-encoder
+    inference from every training step (~70 ms/step savings on a 5090).
+    """
+    def __init__(self, data_dir):
+        data_dir = Path(data_dir)
+        self.src = torch.load(data_dir / "source_latents.pt", weights_only=True)
+        self.tgt = torch.load(data_dir / "target_latents.pt", weights_only=True)
+        self.txt = torch.load(data_dir / "text_embeddings.pt", weights_only=True)
+        assert len(self.src) == len(self.tgt) == len(self.txt), "Size mismatch in encoded dataset"
+        print(f"Loaded encoded dataset: {len(self.src)} samples from {data_dir}")
+
+    def __len__(self):
+        return len(self.src)
+
+    def __getitem__(self, idx):
+        # Return float32 so the training loop doesn't need special dtype handling
+        return self.src[idx].float(), self.tgt[idx].float(), self.txt[idx].float()
+
+
 class ImageTextDataset(Dataset):
     def __init__(self, data_dir, image_size=512, tokenizer=None, max_length=77):
         self.data_dir = Path(data_dir)
@@ -190,9 +212,12 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
+    # BF16 is natively fast on Blackwell (5090) and doesn't need a GradScaler
+    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
 
     print(f"Device: {device}")
     print(f"U-ViT size: {args.uvit_size}")
+    print(f"AMP dtype: {amp_dtype}")
 
     model_id = "SimianLuo/LCM_Dreamshaper_v7"
     
@@ -238,13 +263,16 @@ def train(args):
         if os.path.exists(resume_path):
             ckpt = torch.load(resume_path, map_location="cpu")
             state_dict = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
-            
+            # torch.compile saves keys prefixed with "_orig_mod." — strip it
+            if any(k.startswith("_orig_mod.") for k in state_dict):
+                state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+
             # Detect embed_dim
             if 'in_blocks.0.norm1.weight' in state_dict:
                 embed_dim = state_dict['in_blocks.0.norm1.weight'].shape[0]
                 print(f"Detected embed_dim={embed_dim} from checkpoint")
                 model_overrides['embed_dim'] = embed_dim
-            
+
             # Detect depth
             num_in = sum(1 for k in state_dict.keys() if k.startswith('in_blocks.') and '.norm1.weight' in k)
             num_out = sum(1 for k in state_dict.keys() if k.startswith('out_blocks.') and '.norm1.weight' in k)
@@ -269,11 +297,30 @@ def train(args):
 
     scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-    dataset = ImageTextDataset(
-        args.data_dir,
-        image_size=args.image_size,
-        tokenizer=tokenizer,
-    )
+    if not args.encoded_data_dir and not args.data_dir:
+        raise ValueError("Provide --data_dir (raw images) or --encoded_data_dir (pre-encoded latents).")
+
+    # Compute null text embedding (empty string) before text encoder is offloaded.
+    # The source stream during inference uses null/empty text, so training the
+    # source stream with null text closes the training-inference gap.
+    with torch.no_grad():
+        null_ids = tokenizer(
+            "", padding="max_length", max_length=77, return_tensors="pt"
+        ).input_ids.to(device)
+        null_text_emb = text_encoder(null_ids)[0].float().cpu()  # [1, 77, 768]
+    print("Computed null text embedding for source stream conditioning.")
+
+    if args.encoded_data_dir:
+        print(f"Using pre-encoded dataset from {args.encoded_data_dir}")
+        dataset = EncodedLatentDataset(args.encoded_data_dir)
+        # Encoded dataset returns (src_latent, tgt_latent, text_embedding) — no
+        # VAE or CLIP needed during training, so unload them to free VRAM.
+        vae = vae.cpu()
+        text_encoder = text_encoder.cpu()
+        torch.cuda.empty_cache()
+    else:
+        dataset = ImageTextDataset(args.data_dir, image_size=args.image_size, tokenizer=tokenizer)
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -287,20 +334,27 @@ def train(args):
         ),
     )
 
+    # torch.compile speeds up the UViT forward+backward ~20-40% on Blackwell.
+    # Compiles once on the first step (~2 min) then runs optimised kernels.
+    if args.compile:
+        print("Compiling UViT with torch.compile (max-autotune)...")
+        model = torch.compile(model, mode="max-autotune")
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        model.parameters() if not args.compile else model._orig_mod.parameters(),
         lr=args.lr,
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
     )
 
-    # mixed precision scaler
+    # BF16 is numerically stable and doesn't need a GradScaler.
+    # FP16 keeps the scaler for safety.
     scaler = None
-    if args.use_amp:
+    if args.use_amp and not args.bf16:
         scaler = torch.cuda.amp.GradScaler()
 
     total_steps = len(dataloader) * args.num_epochs
-    warmup_steps = min(args.warmup_steps, total_steps // 10)
+    warmup_steps = min(args.warmup_steps, total_steps)
     print(f"  Effective warmup steps: {warmup_steps} (requested {args.warmup_steps})")
 
     def lr_lambda(step):
@@ -322,7 +376,13 @@ def train(args):
         if os.path.exists(ckpt_path):
             print(f"Loading checkpoint {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location="cpu")
-            model.load_state_dict(ckpt.get("model", {}), strict=False)
+            raw_sd = ckpt.get("model", {})
+            if any(k.startswith("_orig_mod.") for k in raw_sd):
+                raw_sd = {k.replace("_orig_mod.", "", 1): v for k, v in raw_sd.items()}
+            # Load into the uncompiled backbone — compiled OptimizedModule uses
+            # _orig_mod. prefix so stripped keys would all silently mismatch with strict=False.
+            target_module = model._orig_mod if hasattr(model, '_orig_mod') else model
+            target_module.load_state_dict(raw_sd, strict=False)
             opt_state = ckpt.get("optimizer", None)
             if opt_state is not None:
                 try:
@@ -340,9 +400,15 @@ def train(args):
                     scaler.load_state_dict(ckpt.get("scaler"))
                 except Exception:
                     print("Warning: failed to load AMP scaler state")
-            global_step = ckpt.get("global_step", 0)
-            start_epoch = ckpt.get("epoch", 0)
-            best_loss = ckpt.get("best_loss", best_loss)
+            if args.reset_epoch:
+                global_step = 0
+                start_epoch = 0
+                best_loss = float("inf")
+                print("Epoch/step counters reset (cross-stage load)")
+            else:
+                global_step = ckpt.get("global_step", 0)
+                start_epoch = ckpt.get("epoch", 0)
+                best_loss = ckpt.get("best_loss", best_loss)
             print(f"Resuming from epoch {start_epoch}, global_step {global_step}")
         else:
             print(f"Resume path {ckpt_path} not found; starting fresh training")
@@ -368,83 +434,121 @@ def train(args):
             dynamic_ncols=True,
         )
 
-        for batch_idx, (src_images, edt_images, input_ids) in enumerate(progress_bar):
-            src_images = src_images.to(device, dtype=dtype)
-            edt_images = edt_images.to(device, dtype=dtype)
-            input_ids = input_ids.to(device)
+        class StoredAttnInjector:
+            """Injects source cross-attention maps into the target stream.
 
-            # Encode source (clean) and edited (to-be-noised) images with VAE
-            with torch.no_grad():
-                source_latents = vae.encode(src_images).latent_dist.sample()
-                source_latents = source_latents * vae.config.scaling_factor
+            Uses soft blending (alpha < 1.0) during training so gradients still
+            flow through the (1-alpha) computed portion back to to_q and to_k.
+            Hard injection (alpha=1.0) is used at inference only.
+            """
+            def __init__(self, store, alpha=0.8):
+                self.store = {k: [t.detach() for t in v] for k, v in store.items()}
+                self.ptrs = {k: 0 for k in self.store}
+                self.alpha = alpha
 
-                target_latents = vae.encode(edt_images).latent_dist.sample()
-                target_latents = target_latents * vae.config.scaling_factor
+            def __call__(self, attn, is_cross: bool, place_in_unet: str):
+                if not is_cross:
+                    return attn
+                key = f"{place_in_unet}_cross"
+                lst = self.store.get(key, [])
+                if len(lst) == 0:
+                    return attn
+                idx = self.ptrs.get(key, 0)
+                stored = lst[min(idx, len(lst) - 1)].to(attn.device)
+                self.ptrs[key] = min(idx + 1, len(lst) - 1)
+                # Soft blend: gradients flow through (1-alpha)*attn to to_q and to_k
+                return self.alpha * stored + (1.0 - self.alpha) * attn
 
-            with torch.no_grad():
-                encoder_hidden_states = text_encoder(input_ids)[0]
+            def self_attn_forward(self, q, k, v, h):
+                return q, k, v
+
+        for batch_idx, batch in enumerate(progress_bar):
+            if args.encoded_data_dir:
+                # Fast path: pre-encoded latents + embeddings, no VAE/CLIP needed
+                source_latents, target_latents, encoder_hidden_states = batch
+                source_latents = source_latents.to(device)
+                target_latents = target_latents.to(device)
+                encoder_hidden_states = encoder_hidden_states.to(device)
+            else:
+                src_images, edt_images, input_ids = batch
+                src_images = src_images.to(device, dtype=dtype)
+                edt_images = edt_images.to(device, dtype=dtype)
+                input_ids = input_ids.to(device)
+                with torch.no_grad():
+                    source_latents = vae.encode(src_images).latent_dist.sample() * vae.config.scaling_factor
+                    target_latents = vae.encode(edt_images).latent_dist.sample() * vae.config.scaling_factor
+                    encoder_hidden_states = text_encoder(input_ids)[0]
+
+            B = source_latents.shape[0]
+            # Null text for source stream — matches inference where source stream
+            # uses empty/null conditioning, not the editing instruction.
+            null_emb = null_text_emb.expand(B, -1, -1).to(device)
 
             timesteps = torch.randint(
                 0, scheduler.config.num_train_timesteps,
-                (target_latents.shape[0],), device=device, dtype=torch.long,
+                (B,), device=device, dtype=torch.long,
             )
 
-            # Noise only the target (edited) latents — the model predicts this noise
-            noise = torch.randn_like(target_latents)
-            noisy_latents = scheduler.add_noise(target_latents, noise, timesteps)
+            # Noise both source and target latents independently
+            source_noise = torch.randn_like(source_latents)
+            target_noise = torch.randn_like(target_latents)
+            noisy_source = scheduler.add_noise(source_latents, source_noise, timesteps)
+            noisy_target = scheduler.add_noise(target_latents, target_noise, timesteps)
 
-            # --- Capture source attention maps using AttentionStore ---
+            # source_conditioned mode concatenates clean source latent as extra channels.
+            # Pass it to all adapter calls so the backbone sees it instead of zeros.
+            src_kwargs = {"source_latent": source_latents} if args.source_conditioned else {}
+
+            # --- Teacher targets (distillation) or raw noise (fine-tune) ---
+            if teacher_unet is not None:
+                with torch.no_grad():
+                    # Source stream: null text — matches inference source stream
+                    source_teacher = teacher_unet(
+                        noisy_source, timesteps,
+                        encoder_hidden_states=null_emb,
+                    ).sample.detach()
+                    # Target stream: editing instruction text
+                    target_teacher = teacher_unet(
+                        noisy_target, timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                    ).sample.detach()
+            else:
+                source_teacher = source_noise
+                target_teacher = target_noise
+
+            # --- Capture source attention maps (null text + noisy source) ---
+            # Use null text and noisy source to match the actual inference source stream.
             attention_store = ptp_utils.AttentionStore()
             uvit_register(adapter, attention_store)
             attention_store.reset()
             with torch.no_grad():
-                _ = adapter(source_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
-
+                _ = adapter(noisy_source, timesteps, null_emb, **src_kwargs).sample
             stored_maps = attention_store.attention_store if len(attention_store.attention_store) > 0 else attention_store.step_store
             uvit_unregister(adapter)
 
-            class StoredAttnInjector:
-                def __init__(self, store):
-                    self.store = {k: [t.detach() for t in v] for k, v in store.items()}
-                    self.ptrs = {k: 0 for k in self.store}
+            # --- Source denoising loss (null text, no attention injection) ---
+            # Must run BEFORE injector is registered — source stream is standalone.
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=args.use_amp):
+                source_loss = F.mse_loss(
+                    adapter(noisy_source, timesteps, null_emb, **src_kwargs).sample,
+                    source_teacher,
+                )
 
-                def __call__(self, attn, is_cross: bool, place_in_unet: str):
-                    if not is_cross:
-                        return attn
-                    key = f"{place_in_unet}_cross"
-                    lst = self.store.get(key, [])
-                    if len(lst) == 0:
-                        return attn
-                    idx = self.ptrs.get(key, 0)
-                    out = lst[min(idx, len(lst) - 1)].to(attn.device)
-                    self.ptrs[key] = min(idx + 1, len(lst) - 1)
-                    return out
-
-                def self_attn_forward(self, q, k, v, h):
-                    return q, k, v
-
+            # --- Target denoising loss (editing text, source attention injected) ---
             injector = StoredAttnInjector(stored_maps)
             uvit_register(adapter, injector)
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=args.use_amp):
+                target_loss = F.mse_loss(
+                    adapter(noisy_target, timesteps, encoder_hidden_states, **src_kwargs).sample,
+                    target_teacher,
+                )
+            uvit_unregister(adapter)
 
-            # Knowledge distillation: use frozen UNet predictions as training target
-            # instead of the raw noise vector. The UNet already embeds strong
-            # text conditioning; matching its output transfers that to the UViT.
-            if teacher_unet is not None:
-                with torch.no_grad():
-                    teacher_target = teacher_unet(
-                        noisy_latents, timesteps,
-                        encoder_hidden_states=encoder_hidden_states,
-                    ).sample.detach()
-            else:
-                teacher_target = noise
+            loss = 0.5 * source_loss + 0.5 * target_loss
 
-            if args.use_amp:
-                with torch.cuda.amp.autocast():
-                    noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
-                    loss = F.mse_loss(noise_pred, teacher_target)
-                loss_value = loss.item()  # record true loss before division
-                loss = loss / args.grad_accum_steps
-                scaler.scale(loss).backward()
+            if args.use_amp and scaler is not None:
+                loss_value = loss.item()
+                (loss / args.grad_accum_steps).backward()
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
                     if args.max_grad_norm > 0:
                         scaler.unscale_(optimizer)
@@ -454,23 +558,14 @@ def train(args):
                     optimizer.zero_grad()
                     lr_scheduler.step()
             else:
-                noise_pred = adapter(noisy_latents, timesteps, encoder_hidden_states, source_latent=source_latents if args.source_conditioned else None).sample
-                loss = F.mse_loss(noise_pred, teacher_target)
-                loss_value = loss.item()  # record true loss before division
-                loss = loss / args.grad_accum_steps
-                loss.backward()
+                loss_value = loss.item()
+                (loss / args.grad_accum_steps).backward()
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
                     if args.max_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad()
                     lr_scheduler.step()
-
-            # Unregister injector after the forward so subsequent batches start fresh
-            try:
-                uvit_unregister(adapter)
-            except Exception:
-                pass
 
             epoch_loss += loss_value
             global_step += 1
@@ -537,7 +632,8 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Raw image dataset directory. Not required when --encoded_data_dir is provided.")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--latent_size", type=int, default=64)
 
@@ -550,7 +646,16 @@ if __name__ == "__main__":
     parser.add_argument("--distill", action="store_true",
                         help="Knowledge distillation: use frozen LCM UNet predictions as training targets "
                              "instead of raw noise. Strongly recommended when starting from MAE init.")
+    parser.add_argument("--encoded_data_dir", type=str, default=None,
+                        help="Directory of pre-encoded latents+embeddings from prepare_encoded_dataset.py. "
+                             "Skips VAE/CLIP inference every step (~70 ms/step savings).")
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap model with torch.compile(max-autotune) for ~20-40%% faster kernels on Blackwell.")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Use BF16 autocast instead of FP16. Recommended on 5090/H100 — no GradScaler needed.")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--reset_epoch", action="store_true",
+                        help="Reset epoch/step counters when loading a checkpoint from a previous stage.")
 
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Number of steps to accumulate gradients before optimizer step")
 

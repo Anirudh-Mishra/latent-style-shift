@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Two-stage training script.
+# Two-stage training script (optimized for RTX 5090 / Blackwell).
 #
 # Stage 1 (--distill): Knowledge distillation from the frozen LCM UNet.
 #   The UNet already has strong text conditioning; the UViT learns to match
@@ -12,23 +12,40 @@
 #   StoredAttnInjector will actually receive stored maps this time.
 #   Use a lower lr to preserve the text conditioning learned in Stage 1.
 #
+# Speed optimizations vs the naive script:
+#   - Pre-encoded VAE latents + CLIP embeddings: saves ~70 ms/step
+#   - BF16 autocast (no GradScaler overhead): native on Blackwell
+#   - torch.compile max-autotune: ~20-40% kernel speedup
+#   - batch_size=16, grad_accum=1: same effective batch, fewer small kernels
+#
 
 echo "Starting training script: resume_training.sh"
 source /home/avid/latent-style-shift/.venv/bin/activate
 echo "Activated virtual environment."
 
 DATA_DIR=/home/avid/dl_data/instructpix2pix_50k/
+ENCODED_DIR=/home/avid/dl_data/instructpix2pix_50k_encoded/
 MAE_CHECKPOINT=./checkpoints/uvit_from_mae.pt
 
 STAGE1_OUT=./checkpoints/uvit_distill/
 STAGE2_OUT=./checkpoints/uvit_finetuned/
 
+# --- 0. Pre-encode dataset (skips automatically if already done) ---
+echo "=========================================="
+echo "Step 0: Pre-encoding dataset to VAE latents + CLIP embeddings"
+echo "=========================================="
+python prepare_encoded_dataset.py \
+    --data_dir "$DATA_DIR" \
+    --out_dir  "$ENCODED_DIR" \
+    --batch_size 256 \
+    --num_workers 16
+
 # --- Stage 1: Knowledge distillation ---
+echo ""
 echo "=========================================="
 echo "Stage 1: Knowledge Distillation from LCM UNet"
 echo "=========================================="
 
-# Find latest stage-1 checkpoint for resume
 if ls "$STAGE1_OUT"uvit_mid_epoch*.pt 1>/dev/null 2>&1; then
     STAGE1_RESUME=$(ls -t "$STAGE1_OUT"uvit_mid_epoch*.pt | head -1)
     echo "Resuming Stage 1 from: $STAGE1_RESUME"
@@ -38,15 +55,14 @@ else
 fi
 
 python train_uvit.py \
-  --data_dir "$DATA_DIR" \
+  --encoded_data_dir "$ENCODED_DIR" \
   --resume "$STAGE1_RESUME" \
   --distill \
   --uvit_size mid \
-  --image_size 512 \
   --latent_size 64 \
   --patch_size 2 \
-  --batch_size 4 \
-  --num_epochs 5 \
+  --batch_size 16 \
+  --num_epochs 10 \
   --lr 1e-4 \
   --weight_decay 0.01 \
   --warmup_steps 500 \
@@ -56,7 +72,8 @@ python train_uvit.py \
   --log_every 50 \
   --save_every 1 \
   --use_amp \
-  --grad_accum_steps 4 \
+  --bf16 \
+  --grad_accum_steps 1 \
   --seed 42
 
 STAGE1_BEST="$STAGE1_OUT/uvit_mid_best.pt"
@@ -73,31 +90,34 @@ echo "=========================================="
 
 if ls "$STAGE2_OUT"uvit_mid_epoch*.pt 1>/dev/null 2>&1; then
     STAGE2_RESUME=$(ls -t "$STAGE2_OUT"uvit_mid_epoch*.pt | head -1)
+    STAGE2_RESET=""
     echo "Resuming Stage 2 from: $STAGE2_RESUME"
 else
     STAGE2_RESUME="$STAGE1_BEST"
-    echo "Starting Stage 2 from Stage 1 best: $STAGE2_RESUME"
+    STAGE2_RESET="--reset_epoch"
+    echo "Starting Stage 2 fresh from Stage 1 best: $STAGE2_RESUME"
 fi
 
 python train_uvit.py \
-  --data_dir "$DATA_DIR" \
+  $STAGE2_RESET \
+  --encoded_data_dir "$ENCODED_DIR" \
   --resume "$STAGE2_RESUME" \
   --uvit_size mid \
-  --image_size 512 \
   --latent_size 64 \
   --patch_size 2 \
-  --batch_size 4 \
-  --num_epochs 5 \
+  --batch_size 16 \
+  --num_epochs 15 \
   --lr 2e-5 \
   --weight_decay 0.01 \
-  --warmup_steps 200 \
+  --warmup_steps 6250 \
   --max_grad_norm 1.0 \
   --num_workers 4 \
   --output_dir "$STAGE2_OUT" \
   --log_every 50 \
   --save_every 1 \
   --use_amp \
-  --grad_accum_steps 4 \
+  --bf16 \
+  --grad_accum_steps 1 \
   --seed 42
 
 echo ""

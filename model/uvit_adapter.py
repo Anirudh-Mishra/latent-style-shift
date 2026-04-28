@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import einops
 from types import SimpleNamespace
 from uvit_backbone import UViTBackbone, UVIT_CONFIGS
@@ -97,11 +98,15 @@ def register_attention_control(adapter: UViTAdapter, controller):
             # but with source k/v injected, or rearranged row order)
             B_out = q.shape[0] // h
 
-            attn = (q @ k.transpose(-2, -1)) * attn_module.scale
-            attn = attn.softmax(dim=-1)
-            attn = attn_module.attn_drop(attn)
-            out = attn @ v  # (B_out*h, L, D)
-            out = out.reshape(B_out, h, L, D).permute(0, 2, 1, 3).reshape(B_out, L, h * D)
+            # Use Flash Attention via SDPA; reshape to (B_out, h, L, D) format.
+            # Cross-attention processor keeps manual attn because UAC needs the map.
+            out = F.scaled_dot_product_attention(
+                q.view(B_out, h, L, D),
+                k.view(B_out, h, L, D),
+                v.view(B_out, h, L, D),
+                dropout_p=attn_module.attn_drop.p if attn_module.training else 0.0,
+            )  # (B_out, h, L, D)
+            out = out.permute(0, 2, 1, 3).reshape(B_out, L, h * D)
             out = attn_module.proj(out)
             out = attn_module.proj_drop(out)
             return out

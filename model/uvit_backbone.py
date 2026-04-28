@@ -100,22 +100,16 @@ class SelfAttention(nn.Module):
 
     def _default_forward(self, x):
         B, L, C = x.shape
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
-
-        D = self.head_dim
-        H = self.num_heads
-        q = q.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
-        k = k.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
-        v = v.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
-
-        sim = (q @ k.transpose(-2, -1)) * self.scale
-        attn = sim.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        out = attn @ v
-        out = out.view(B, self.num_heads, L, D).permute(0, 2, 1, 3).contiguous().view(B, L, self.num_heads * D)
+        H, D = self.num_heads, self.head_dim
+        # (B, L, H, D) → (B, H, L, D) for SDPA / Flash Attention
+        q = self.to_q(x).view(B, L, H, D).permute(0, 2, 1, 3)
+        k = self.to_k(x).view(B, L, H, D).permute(0, 2, 1, 3)
+        v = self.to_v(x).view(B, L, H, D).permute(0, 2, 1, 3)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, L, H * D)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
@@ -149,23 +143,16 @@ class CrossAttention(nn.Module):
 
     def _default_forward(self, x, context):
         B, L, C = x.shape
-
-        q = self.to_q(x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-
-        D = self.head_dim
-        H = self.num_heads
-        q = q.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
-        k = k.view(B, k.shape[1], H, D).permute(0, 2, 1, 3).contiguous().view(B * H, k.shape[1], D)
-        v = v.view(B, v.shape[1], H, D).permute(0, 2, 1, 3).contiguous().view(B * H, v.shape[1], D)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        out = attn @ v
-        out = out.view(B, self.num_heads, L, D).permute(0, 2, 1, 3).contiguous().view(B, L, self.num_heads * D)
+        H, D = self.num_heads, self.head_dim
+        Lk = context.shape[1]
+        q = self.to_q(x).view(B, L, H, D).permute(0, 2, 1, 3)
+        k = self.to_k(context).view(B, Lk, H, D).permute(0, 2, 1, 3)
+        v = self.to_v(context).view(B, Lk, H, D).permute(0, 2, 1, 3)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, L, H * D)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
@@ -289,6 +276,18 @@ class UViTBackbone(nn.Module):
 
         self._init_pos_embed()
         self.apply(self._init_weights)
+
+        # Zero-init cross-attention output projections so they start as no-ops,
+        # letting the pretrained MAE self-attention features flow cleanly at step 0.
+        # skip_linear is NOT zero-inited — it replaces x entirely (not a residual add),
+        # so zeros would kill the forward pass through all out_blocks.
+        for block in list(self.in_blocks) + [self.mid_block] + list(self.out_blocks):
+            nn.init.zeros_(block.cross_attn.proj.weight)
+            if block.cross_attn.proj.bias is not None:
+                nn.init.zeros_(block.cross_attn.proj.bias)
+        nn.init.zeros_(self.decoder_pred.weight)
+        if self.decoder_pred.bias is not None:
+            nn.init.zeros_(self.decoder_pred.bias)
 
     def _init_pos_embed(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)

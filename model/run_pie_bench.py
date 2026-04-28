@@ -3,7 +3,7 @@ from pipeline_ead import EditPipeline
 import os
 import gradio as gr
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch.nn.functional as nnf
 from typing import Optional, Union, Tuple, List, Callable, Dict
 import abc
@@ -42,6 +42,10 @@ encoder = pipe.text_encoder
 
 if torch.cuda.is_available():
     pipe = pipe.to("cuda")
+
+# Disable safety checker for research/benchmark use — out-of-range latents from
+# an undertrained model trigger false positives and return black images.
+pipe.safety_checker = None
 
 
 class LocalBlend:
@@ -418,8 +422,7 @@ def inference(source_prompt, target_prompt, positive_prompt, negative_prompt, lo
                cross_replace_steps=0.8, self_replace_steps=0.4, eta=0.1, thresh_e=0.3, thresh_m=0.3, denoise=True):
 
     torch.manual_seed(seed)
-    ratio = min(height / img.height, width / img.width)
-    img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+    img = img.resize((width, height), Image.Resampling.LANCZOS)
     if denoise is False:
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps*strength)
@@ -508,7 +511,10 @@ def main():
         if args.uvit_checkpoint:
             raw = torch.load(args.uvit_checkpoint, map_location="cpu")
             state_dict = raw.get("model", raw.get("model_state_dict", raw))
-            
+            # torch.compile saves keys prefixed with "_orig_mod." — strip it
+            if any(k.startswith("_orig_mod.") for k in state_dict):
+                state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+
             # Infer embed_dim from checkpoint
             if 'in_blocks.0.norm1.weight' in state_dict:
                 embed_dim = state_dict['in_blocks.0.norm1.weight'].shape[0]
@@ -571,11 +577,13 @@ def main():
         source_prompt =  annotation["original_prompt"]
         target_prompt =  annotation["editing_prompt"]
         if annotation["blended_word"]!="":
-            local = annotation["blended_word"].split(" ")[1]
+            local = annotation["blended_word"].split(" ")[-1]
         else:
             local = ""
+        # Source stream uses null text at inference to match training (source stream
+        # was trained with empty-string conditioning, not the image description).
         image_out = inference(
-            source_prompt, target_prompt, "", "", local, "", args.guidance_s, args.guidance_t,
+            "", target_prompt, "", "", local, "", args.guidance_s, args.guidance_t,
             num_inference_steps=args.num_inference_steps,
             width=512, height=512, seed=args.seed, img=imagein,
             strength=args.strength,
@@ -591,7 +599,10 @@ def main():
         full_dir_path = os.path.join(target, "annotation_images", annotation_dir)
         os.makedirs(full_dir_path, exist_ok=True)
 
-        # Now save the image
+        # Mild Gaussian blur to reduce UViT patch-boundary artifacts (16px grid).
+        # Sigma=0.8 softens seams without significantly blurring edit content.
+        image_out = image_out.filter(ImageFilter.GaussianBlur(radius=0.8))
+
         out_path = os.path.join(full_dir_path, os.path.basename(annotation["image_path"]))
         image_out.save(out_path)    
     # Now you can use args.cross_replace_steps, args.guidance, and args.strength in your script
