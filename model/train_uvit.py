@@ -383,29 +383,35 @@ def train(args):
             # _orig_mod. prefix so stripped keys would all silently mismatch with strict=False.
             target_module = model._orig_mod if hasattr(model, '_orig_mod') else model
             target_module.load_state_dict(raw_sd, strict=False)
-            opt_state = ckpt.get("optimizer", None)
-            if opt_state is not None:
-                try:
-                    optimizer.load_state_dict(opt_state)
-                except Exception:
-                    print("Warning: failed to fully load optimizer state; continuing with fresh optimizer")
-            lr_state = ckpt.get("lr_scheduler", None)
-            if lr_state is not None:
-                try:
-                    lr_scheduler.load_state_dict(lr_state)
-                except Exception:
-                    print("Warning: failed to load lr_scheduler state")
-            if args.use_amp and "scaler" in ckpt and ckpt.get("scaler") is not None:
-                try:
-                    scaler.load_state_dict(ckpt.get("scaler"))
-                except Exception:
-                    print("Warning: failed to load AMP scaler state")
             if args.reset_epoch:
+                # Cross-stage load: weights only — skip optimizer and scheduler state
+                # so Phase 2 starts with clean Adam momentum and a fresh LR warmup.
+                # Loading Stage 1's optimizer state would bias early Phase 2 updates
+                # toward Stage 1 gradient directions (wrong for the new edit_loss).
+                # Loading Stage 1's lr_scheduler would set last_epoch=~31250, skipping
+                # warmup entirely and hitting LR=0 partway through Phase 2.
                 global_step = 0
                 start_epoch = 0
                 best_loss = float("inf")
-                print("Epoch/step counters reset (cross-stage load)")
+                print("Epoch/step/lr_scheduler/optimizer reset (cross-stage load)")
             else:
+                opt_state = ckpt.get("optimizer", None)
+                if opt_state is not None:
+                    try:
+                        optimizer.load_state_dict(opt_state)
+                    except Exception:
+                        print("Warning: failed to fully load optimizer state; continuing with fresh optimizer")
+                lr_state = ckpt.get("lr_scheduler", None)
+                if lr_state is not None:
+                    try:
+                        lr_scheduler.load_state_dict(lr_state)
+                    except Exception:
+                        print("Warning: failed to load lr_scheduler state")
+                if args.use_amp and "scaler" in ckpt and ckpt.get("scaler") is not None:
+                    try:
+                        scaler.load_state_dict(ckpt.get("scaler"))
+                    except Exception:
+                        print("Warning: failed to load AMP scaler state")
                 global_step = ckpt.get("global_step", 0)
                 start_epoch = ckpt.get("epoch", 0)
                 best_loss = ckpt.get("best_loss", best_loss)
@@ -454,7 +460,7 @@ def train(args):
                 if len(lst) == 0:
                     return attn
                 idx = self.ptrs.get(key, 0)
-                stored = lst[min(idx, len(lst) - 1)].to(attn.device)
+                stored = lst[min(idx, len(lst) - 1)].to(device=attn.device, dtype=attn.dtype)
                 self.ptrs[key] = min(idx + 1, len(lst) - 1)
                 # Soft blend: gradients flow through (1-alpha)*attn to to_q and to_k
                 return self.alpha * stored + (1.0 - self.alpha) * attn
@@ -495,6 +501,15 @@ def train(args):
             noisy_source = scheduler.add_noise(source_latents, source_noise, timesteps)
             noisy_target = scheduler.add_noise(target_latents, target_noise, timesteps)
 
+            # Phase 3 same-latent training: replace noisy_target with noisy_source so
+            # the model must use text alone to drive e_t - e_s. This directly trains the
+            # inference scenario where both streams start from the same DDIM-inverted
+            # latent and only the text conditioning can produce a non-zero edit direction.
+            # The teacher also receives noisy_source so its CFG direction
+            # (UNet(z, edit_text) - UNet(z, null_text)) becomes the training target.
+            if args.same_latent_prob > 0.0 and torch.rand(1).item() < args.same_latent_prob:
+                noisy_target = noisy_source
+
             # source_conditioned mode concatenates clean source latent as extra channels.
             # Pass it to all adapter calls so the backbone sees it instead of zeros.
             src_kwargs = {"source_latent": source_latents} if args.source_conditioned else {}
@@ -516,35 +531,41 @@ def train(args):
                 source_teacher = source_noise
                 target_teacher = target_noise
 
-            # --- Capture source attention maps (null text + noisy source) ---
-            # Use null text and noisy source to match the actual inference source stream.
+            # --- Source denoising loss + attention map capture (single pass) ---
+            # Registering AttentionStore during the grad-enabled pass captures maps
+            # in the same dtype as training (BF16 when AMP is on), eliminating the
+            # float32/BF16 dtype mismatch that would otherwise occur when those maps
+            # are injected into the BF16 target pass. AttentionStore.forward returns
+            # attn unchanged so gradients flow normally through the source stream.
             attention_store = ptp_utils.AttentionStore()
             uvit_register(adapter, attention_store)
             attention_store.reset()
-            with torch.no_grad():
-                _ = adapter(noisy_source, timesteps, null_emb, **src_kwargs).sample
-            stored_maps = attention_store.attention_store if len(attention_store.attention_store) > 0 else attention_store.step_store
-            uvit_unregister(adapter)
-
-            # --- Source denoising loss (null text, no attention injection) ---
-            # Must run BEFORE injector is registered — source stream is standalone.
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=args.use_amp):
-                source_loss = F.mse_loss(
-                    adapter(noisy_source, timesteps, null_emb, **src_kwargs).sample,
-                    source_teacher,
-                )
+                pred_s = adapter(noisy_source, timesteps, null_emb, **src_kwargs).sample
+                source_loss = F.mse_loss(pred_s, source_teacher)
+            stored_maps = attention_store.step_store
+            uvit_unregister(adapter)
 
             # --- Target denoising loss (editing text, source attention injected) ---
-            injector = StoredAttnInjector(stored_maps)
+            injector = StoredAttnInjector(stored_maps, alpha=args.inject_alpha)
             uvit_register(adapter, injector)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=args.use_amp):
-                target_loss = F.mse_loss(
-                    adapter(noisy_target, timesteps, encoder_hidden_states, **src_kwargs).sample,
-                    target_teacher,
-                )
+                pred_t = adapter(noisy_target, timesteps, encoder_hidden_states, **src_kwargs).sample
+                target_loss = F.mse_loss(pred_t, target_teacher)
             uvit_unregister(adapter)
 
-            loss = 0.5 * source_loss + 0.5 * target_loss
+            # Edit direction loss: explicitly train (pred_t - pred_s) to encode the edit
+            # instruction. This is the exact DDCM quantity (e_t - e_s) used at inference,
+            # so directly optimizing it closes the gap that causes e_t ≈ e_s → no edit.
+            edit_loss_value = 0.0
+            if args.edit_loss_weight > 0.0:
+                edit_dir_pred = pred_t.float() - pred_s.float()
+                edit_dir_teacher = target_teacher - source_teacher
+                edit_loss = F.mse_loss(edit_dir_pred, edit_dir_teacher)
+                edit_loss_value = edit_loss.item()
+                loss = (1.0 - args.edit_loss_weight) * (0.5 * source_loss + 0.5 * target_loss) + args.edit_loss_weight * edit_loss
+            else:
+                loss = 0.5 * source_loss + 0.5 * target_loss
 
             if args.use_amp and scaler is not None:
                 loss_value = loss.item()
@@ -572,10 +593,14 @@ def train(args):
 
             avg = epoch_loss / (batch_idx + 1)
             lr = optimizer.param_groups[0]["lr"]
-            progress_bar.set_postfix(loss=f"{loss_value:.4f}", avg=f"{avg:.4f}", lr=f"{lr:.2e}")
+            postfix = dict(loss=f"{loss_value:.4f}", avg=f"{avg:.4f}", lr=f"{lr:.2e}")
+            if edit_loss_value > 0.0:
+                postfix["edloss"] = f"{edit_loss_value:.4f}"
+            progress_bar.set_postfix(postfix)
 
             if global_step % args.log_every == 0:
-                print(f"  [Step {global_step}] loss={loss_value:.4f}  avg={avg:.4f}  lr={lr:.2e}")
+                edit_str = f"  edloss={edit_loss_value:.4f}" if edit_loss_value > 0.0 else ""
+                print(f"  [Step {global_step}] loss={loss_value:.4f}  avg={avg:.4f}  lr={lr:.2e}{edit_str}")
 
         epoch_loss /= len(dataloader)
         elapsed = time.time() - t0
@@ -646,6 +671,17 @@ if __name__ == "__main__":
     parser.add_argument("--distill", action="store_true",
                         help="Knowledge distillation: use frozen LCM UNet predictions as training targets "
                              "instead of raw noise. Strongly recommended when starting from MAE init.")
+    parser.add_argument("--same_latent_prob", type=float, default=0.0,
+                        help="Probability of replacing noisy_target with noisy_source each step. "
+                             "Forces the model to use text conditioning alone to drive e_t - e_s, "
+                             "matching the inference scenario. Recommended 0.5 for Phase 3.")
+    parser.add_argument("--inject_alpha", type=float, default=0.8,
+                        help="Source attention injection blend factor during training (0=no injection, 1=hard replace). "
+                             "Lower values (e.g. 0.4) let the target stream see more edit-text gradient in Phase 2.")
+    parser.add_argument("--edit_loss_weight", type=float, default=0.0,
+                        help="Weight for the edit direction loss MSE(pred_t - pred_s, teacher_t - teacher_s). "
+                             "Directly trains the DDCM quantity e_t - e_s to encode the edit. "
+                             "Recommended: 0.5 for Phase 2. Default 0 (disabled) for backward compatibility.")
     parser.add_argument("--encoded_data_dir", type=str, default=None,
                         help="Directory of pre-encoded latents+embeddings from prepare_encoded_dataset.py. "
                              "Skips VAE/CLIP inference every step (~70 ms/step savings).")

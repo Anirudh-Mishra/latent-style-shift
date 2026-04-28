@@ -22,7 +22,7 @@ is_colab = utils.is_google_colab()
 colab_instruction = "" if is_colab else """
 Colab Instuction"""
 
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
 device_print = "GPU 🔥" if torch.cuda.is_available() else "CPU 🥶"
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -492,6 +492,10 @@ def main():
     parser.add_argument('--uvit_checkpoint', type=str, default=None)
     parser.add_argument('--uvit_patch_size', type=int, default=2, help='Patch size used by the U-ViT checkpoint')
     parser.add_argument('--source_conditioned', action='store_true', help='Enable source-conditioned U-ViT; must match training/init')
+    parser.add_argument('--patch_smooth_sigma', type=float, default=0.7,
+                        help='Gaussian sigma (in latent pixels) applied to UViT predictions at inference to suppress '
+                             '2-pixel patch-boundary artifacts. 0 disables. Default 0.7 attenuates 2px artifacts '
+                             'to ~15%% while preserving 8px+ structure above 90%%.')
 
     args = parser.parse_args()
 
@@ -545,6 +549,7 @@ def main():
         
         _adapter = create_uvit_adapter(
             preset=args.uvit_size,
+            patch_smooth_sigma=args.patch_smooth_sigma,
             **uvit_overrides
         )
         
@@ -556,6 +561,7 @@ def main():
             if unexpected:
                 print(f"Warning: unexpected UViT checkpoint keys: {len(unexpected)}")
         _adapter = _adapter.to(dtype=torch_dtype)
+        _adapter.eval()
         if torch.cuda.is_available():
             _adapter = _adapter.to("cuda")
         pipe.unet = _adapter

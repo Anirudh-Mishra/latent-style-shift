@@ -18,9 +18,10 @@ class UViTNamedBlock(nn.Module):
 
 
 class UViTAdapter(nn.Module):
-    def __init__(self, backbone: UViTBackbone):
+    def __init__(self, backbone: UViTBackbone, patch_smooth_sigma: float = 0.0):
         super().__init__()
         self.backbone = backbone
+        self.patch_smooth_sigma = patch_smooth_sigma
 
         self.down = UViTNamedBlock(backbone.in_blocks)
         self.mid = UViTNamedBlock(backbone.mid_block)
@@ -53,7 +54,25 @@ class UViTAdapter(nn.Module):
 
         noise_pred = self.backbone(sample, timestep, encoder_hidden_states,
                                    source_latent=source_latent)
+
+        # At inference, suppress 2-pixel patch-boundary artifacts with a depthwise
+        # Gaussian blur before the prediction is used for guidance. At sigma=0.7 in
+        # latent space this reduces the 2-pixel artifact frequency to ~15% while
+        # keeping structure at 8+ pixels above 90%. Not applied during training so
+        # gradients and loss values are unaffected.
+        if not self.training and self.patch_smooth_sigma > 0.0:
+            noise_pred = self._smooth_patch_artifacts(noise_pred, self.patch_smooth_sigma)
+
         return UViTOutput(noise_pred)
+
+    def _smooth_patch_artifacts(self, x, sigma=0.7):
+        k = 3
+        coords = torch.arange(k, dtype=torch.float32, device=x.device) - k // 2
+        g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+        kernel = g[:, None] * g[None, :]
+        kernel = (kernel / kernel.sum()).to(dtype=x.dtype)
+        kernel = kernel[None, None].expand(x.shape[1], 1, k, k).contiguous()
+        return F.conv2d(x.float(), kernel.float(), padding=k // 2, groups=x.shape[1]).to(x.dtype)
 
     def to(self, *args, **kwargs):
         result = super().to(*args, **kwargs)
@@ -176,6 +195,6 @@ def has_attention_processors(adapter: UViTAdapter) -> bool:
     )
 
 
-def create_uvit_adapter(preset="mid", **overrides):
+def create_uvit_adapter(preset="mid", patch_smooth_sigma: float = 0.0, **overrides):
     backbone = UViTBackbone.from_preset(preset, **overrides)
-    return UViTAdapter(backbone)
+    return UViTAdapter(backbone, patch_smooth_sigma=patch_smooth_sigma)
