@@ -173,6 +173,7 @@ all_tgt_image_folders={
     "8_ablation_directinversion_add-target+p2p":"output/ablation_directinversion_add-target+p2p/annotation_images",
     "infedit": r"D:\CMU\Projects\InfEdit\infedit_outputs\annotation_images",
     "pix2pix": "pix2pix_outputs/annotation_images",
+    "uvit": r"/ocean/projects/cis260127p/amishra7/latent-style-shift/model/outputs_uvit_final/annotation_images",
     }
 
 

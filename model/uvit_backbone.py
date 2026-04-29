@@ -27,23 +27,29 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 
 
 def patchify(imgs, patch_size):
-    return einops.rearrange(
-        imgs, "B C (h p1) (w p2) -> B (h w) (p1 p2 C)", p1=patch_size, p2=patch_size
-    )
+    B, C, H, W = imgs.shape
+    assert H % patch_size == 0 and W % patch_size == 0
+    h = H // patch_size
+    w = W // patch_size
+    x = imgs.reshape(B, C, h, patch_size, w, patch_size)
+    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    x = x.view(B, h * w, patch_size * patch_size * C)
+    return x
 
 
 def unpatchify(x, channels, patch_size, h, w):
-    return einops.rearrange(
-        x,
-        "B (h w) (p1 p2 C) -> B C (h p1) (w p2)",
-        h=h, w=w, p1=patch_size, p2=patch_size, C=channels,
-    )
+    B = x.shape[0]
+    x = x.view(B, h, w, patch_size, patch_size, channels)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+    x = x.view(B, channels, h * patch_size, w * patch_size)
+    return x
 
 
 class PatchEmbed(nn.Module):
     def __init__(self, patch_size, in_chans=4, embed_dim=512):
         super().__init__()
         self.patch_size = patch_size
+        # in_chans may be doubled (8) when source latent is channel-concatenated
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
@@ -89,6 +95,8 @@ class SelfAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.processor = None
+        # Set by register_attention_control to route stored maps correctly
+        self._place_in_unet = "mid"
 
     def _default_forward(self, x):
         B, L, C = x.shape
@@ -96,22 +104,26 @@ class SelfAttention(nn.Module):
         k = self.to_k(x)
         v = self.to_v(x)
 
-        q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=self.num_heads)
-        k = einops.rearrange(k, "B L (H D) -> (B H) L D", H=self.num_heads)
-        v = einops.rearrange(v, "B L (H D) -> (B H) L D", H=self.num_heads)
+        D = self.head_dim
+        H = self.num_heads
+        q = q.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
+        k = k.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
+        v = v.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        sim = (q @ k.transpose(-2, -1)) * self.scale
+        attn = sim.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         out = attn @ v
-        out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=self.num_heads)
+        out = out.view(B, self.num_heads, L, D).permute(0, 2, 1, 3).contiguous().view(B, L, self.num_heads * D)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
 
     def forward(self, x):
         if self.processor is not None:
+            # Delegate entirely to the processor (e.g. UViTSelfAttnProcessor in ptp_utils).
+            # Convention: processor(attn_module, x) -> output tensor of shape (B, L, C).
             return self.processor(self, x)
         return self._default_forward(x)
 
@@ -132,6 +144,8 @@ class CrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.processor = None
+        # Set by register_attention_control to route stored maps correctly
+        self._place_in_unet = "mid"
 
     def _default_forward(self, x, context):
         B, L, C = x.shape
@@ -140,22 +154,26 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q = einops.rearrange(q, "B L (H D) -> (B H) L D", H=self.num_heads)
-        k = einops.rearrange(k, "B S (H D) -> (B H) S D", H=self.num_heads)
-        v = einops.rearrange(v, "B S (H D) -> (B H) S D", H=self.num_heads)
+        D = self.head_dim
+        H = self.num_heads
+        q = q.view(B, L, H, D).permute(0, 2, 1, 3).contiguous().view(B * H, L, D)
+        k = k.view(B, k.shape[1], H, D).permute(0, 2, 1, 3).contiguous().view(B * H, k.shape[1], D)
+        v = v.view(B, v.shape[1], H, D).permute(0, 2, 1, 3).contiguous().view(B * H, v.shape[1], D)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         out = attn @ v
-        out = einops.rearrange(out, "(B H) L D -> B L (H D)", H=self.num_heads)
+        out = out.view(B, self.num_heads, L, D).permute(0, 2, 1, 3).contiguous().view(B, L, self.num_heads * D)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
 
     def forward(self, x, context):
         if self.processor is not None:
+            # Delegate entirely to the processor (e.g. UViTCrossAttnProcessor in ptp_utils).
+            # Convention: processor(attn_module, x, context) -> output tensor of shape (B, L, C).
             return self.processor(self, x, context)
         return self._default_forward(x, context)
 
@@ -202,6 +220,7 @@ class UViTBackbone(nn.Module):
         qkv_bias=True,
         norm_layer=nn.LayerNorm,
         conv_output=True,
+        source_conditioned=False,
     ):
         super().__init__()
         self.img_size = img_size
@@ -209,8 +228,13 @@ class UViTBackbone(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
         self.depth = depth
+        self.source_conditioned = source_conditioned
 
-        self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        # When source_conditioned=True the noisy target latent and the clean
+        # source latent are concatenated channel-wise before patch embedding,
+        # doubling the input channel count.
+        patch_in_chans = in_chans * 2 if source_conditioned else in_chans
+        self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=patch_in_chans, embed_dim=embed_dim)
         self.num_patches = (img_size // patch_size) ** 2
 
         self.time_embed = nn.Sequential(
@@ -251,12 +275,28 @@ class UViTBackbone(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.patch_dim = patch_size ** 2 * in_chans
         self.decoder_pred = nn.Linear(embed_dim, self.patch_dim, bias=True)
-        self.final_layer = (
-            nn.Conv2d(in_chans, in_chans, 3, padding=1) if conv_output else nn.Identity()
-        )
+
+        # Convolutional output refinement — smooths patch boundary artifacts
+        # that arise from independently predicted per-patch outputs.
+        # This is critical: without it each patch is predicted independently
+        # and the unpatchified result shows a visible grid at every boundary.
+        if conv_output:
+            self.final_layer = nn.Sequential(
+                nn.Conv2d(in_chans, in_chans, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(in_chans, in_chans, 3, padding=1),
+            )
+        else:
+            self.final_layer = nn.Identity()
 
         self._init_pos_embed()
         self.apply(self._init_weights)
+
+        # Zero-initialize decoder_pred so the model starts by predicting ~zero
+        # noise rather than random noise — a much safer training starting point.
+        with torch.no_grad():
+            nn.init.zeros_(self.decoder_pred.weight)
+            nn.init.zeros_(self.decoder_pred.bias)
 
     def _init_pos_embed(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -282,10 +322,18 @@ class UViTBackbone(nn.Module):
         cfg = {**UVIT_CONFIGS[preset], **overrides}
         return cls(**cfg)
 
-    def forward(self, x, timesteps, encoder_hidden_states):
+    def forward(self, x, timesteps, encoder_hidden_states, source_latent=None):
         B, C, H, W = x.shape
         h_patches = H // self.patch_size
         w_patches = W // self.patch_size
+
+        # Optionally concatenate clean source latent as extra conditioning channels
+        if self.source_conditioned:
+            if source_latent is None:
+                # Fall back to zeros if no source provided (e.g. during pure inference
+                # without source conditioning, or when called by the diffusers pipeline)
+                source_latent = torch.zeros_like(x)
+            x = torch.cat([x, source_latent], dim=1)  # (B, 2*C, H, W)
 
         x = self.patch_embed(x)
 
@@ -318,6 +366,18 @@ class UViTBackbone(nn.Module):
         x = x[:, self.extras:, :]
         x = unpatchify(x, self.in_chans, self.patch_size, h_patches, w_patches)
 
+        x = self._smooth_patches(x)
         x = self.final_layer(x)
 
         return x
+
+    def _smooth_patches(self, x):
+        k = 3
+        sigma = 0.8
+        ax = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
+        kernel_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        C = x.shape[1]
+        weight = kernel_2d.unsqueeze(0).unsqueeze(0).expand(C, 1, k, k)
+        return F.conv2d(x, weight, padding=k // 2, groups=C)

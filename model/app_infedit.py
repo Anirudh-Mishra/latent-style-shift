@@ -32,6 +32,8 @@ _parser.add_argument("--backbone", type=str, default=os.environ.get("BACKBONE", 
 _parser.add_argument("--uvit_size", type=str, default="mid",
                       choices=["small", "mid", "large"])
 _parser.add_argument("--uvit_checkpoint", type=str, default=None)
+_parser.add_argument("--source_conditioned", action="store_true",
+                      help="Enable source-conditioned UViT (must match training flag)")
 _args, _ = _parser.parse_known_args()
 
 if is_colab:
@@ -42,13 +44,29 @@ else:
     pipe = EditPipeline.from_pretrained(model_id_or_path, use_auth_token=os.environ.get("USER_TOKEN"), scheduler=scheduler, torch_dtype=torch_dtype)
 
 if _args.backbone == "uvit":
-    from uvit_adapter import create_uvit_adapter
-    uvit_adapter = create_uvit_adapter(preset=_args.uvit_size)
+    from uvit_adapter import create_uvit_adapter, register_attention_control as uvit_register, has_attention_processors
+    _uvit_overrides = {'source_conditioned': _args.source_conditioned}
     if _args.uvit_checkpoint:
-        state_dict = torch.load(_args.uvit_checkpoint, map_location="cpu")
+        raw = torch.load(_args.uvit_checkpoint, map_location="cpu")
+        # Support all checkpoint formats: {"model": ...}, {"model_state_dict": ...}, bare dict
+        state_dict = raw.get('model', raw.get('model_state_dict', raw))
+        # Detect architecture dims from checkpoint
+        if 'in_blocks.0.norm1.weight' in state_dict:
+            _ed = state_dict['in_blocks.0.norm1.weight'].shape[0]
+            _uvit_overrides['embed_dim'] = _ed
+            _uvit_overrides['num_heads'] = _ed // 64
+        _n_in = sum(1 for k in state_dict if k.startswith('in_blocks.') and '.norm1.weight' in k)
+        _n_out = sum(1 for k in state_dict if k.startswith('out_blocks.') and '.norm1.weight' in k)
+        if _n_in > 0:
+            _uvit_overrides['depth'] = _n_in + 1 + _n_out
+    else:
+        state_dict = None
+    uvit_adapter = create_uvit_adapter(preset=_args.uvit_size, **_uvit_overrides)
+    if state_dict is not None:
         uvit_adapter.backbone.load_state_dict(state_dict, strict=False)
     uvit_adapter = uvit_adapter.to(dtype=torch_dtype)
     pipe.unet = uvit_adapter
+    pipe.safety_checker = None
 
 tokenizer = pipe.tokenizer
 encoder = pipe.text_encoder
@@ -92,7 +110,7 @@ class LocalBlend:
             if len(maps) == 0:
                 return x_m, x_t
             h, w = x_t.shape[2], x_t.shape[3]
-            patch_size = 2
+            patch_size = pipe.unet.backbone.patch_size if hasattr(pipe.unet, 'backbone') else 2
             h_p, w_p = h // patch_size, w // patch_size
             maps = [item[:, 1:h_p*w_p+1, :].reshape(2, -1, 1, h_p, w_p, MAX_NUM_WORDS) for item in maps]
         else:
@@ -254,14 +272,21 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         return out
     
     def self_attn_forward(self, q, k, v, num_heads):
+        sa_blend = self.sa_blend_factor
         if q.shape[0]//num_heads == 3:
             if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
                 q=torch.cat([q[:num_heads*2],q[num_heads:num_heads*2]])
                 k=torch.cat([k[:num_heads*2],k[:num_heads]])
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])
             else:
-                q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])
-                k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])
+                q_src = q[:num_heads]
+                q_edit = q[num_heads:num_heads*2]
+                q_blended = sa_blend * q_src + (1 - sa_blend) * q_edit
+                q=torch.cat([q_src, q_blended, q_src])
+                k_src = k[:num_heads]
+                k_edit = k[num_heads:num_heads*2]
+                k_blended = sa_blend * k_src + (1 - sa_blend) * k_edit
+                k=torch.cat([k_src, k_blended, k_src])
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])
             return q,k,v
         else:
@@ -290,10 +315,10 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
             h = attn.shape[0] // self.batch_size
             attn = attn.reshape(self.batch_size,h,  *attn.shape[1:])
             attn_base, attn_repalce,attn_masa = attn[0], attn[1], attn[2]
-            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce) 
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce)
             attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
             if (self.cross_replace_steps >= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
-                attn[1] = attn_base_store
+                attn[1] = self.ca_blend_factor * attn_replace_new + (1 - self.ca_blend_factor) * attn_repalce
             attn_store=torch.cat([attn_base_store,attn_replace_new])
             attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
             attn_store = attn_store.reshape(2 *h, *attn_store.shape[2:])
@@ -303,7 +328,9 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
     def __init__(self, prompts, num_steps: int,start_steps: int,
                  cross_replace_steps: Union[float, Tuple[float, float], Dict[str, Tuple[float, float]]],
                  self_replace_steps: Union[float, Tuple[float, float]],
-                 local_blend: Optional[LocalBlend]):
+                 local_blend: Optional[LocalBlend],
+                 sa_blend_factor: float = 1.0,
+                 ca_blend_factor: float = 1.0):
         super(AttentionControlEdit, self).__init__()
         self.batch_size = len(prompts)+1
         self.self_replace_steps = self_replace_steps
@@ -311,6 +338,8 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         self.num_steps=num_steps
         self.start_steps=start_steps
         self.local_blend = local_blend
+        self.sa_blend_factor = sa_blend_factor
+        self.ca_blend_factor = ca_blend_factor
 
 
 class AttentionReplace(AttentionControlEdit):
@@ -333,8 +362,10 @@ class AttentionRefine(AttentionControlEdit):
         return attn_replace
 
     def __init__(self, prompts, prompt_specifiers, num_steps: int,start_steps: int, cross_replace_steps: float, self_replace_steps: float,
-                 local_blend: Optional[LocalBlend] = None):
-        super(AttentionRefine, self).__init__(prompts, num_steps,start_steps, cross_replace_steps, self_replace_steps, local_blend)
+                 local_blend: Optional[LocalBlend] = None,
+                 sa_blend_factor: float = 1.0, ca_blend_factor: float = 1.0):
+        super(AttentionRefine, self).__init__(prompts, num_steps,start_steps, cross_replace_steps, self_replace_steps, local_blend,
+                                              sa_blend_factor=sa_blend_factor, ca_blend_factor=ca_blend_factor)
         self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(prompts, prompt_specifiers, tokenizer, encoder, device)
         self.mapper, alphas, ms = self.mapper.to(device), alphas.to(device).to(torch_dtype), ms.to(device).to(torch_dtype)
         self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1])
@@ -378,16 +409,43 @@ def inference(img, source_prompt, target_prompt,
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps*strength)
     num_start = num_inference_steps-num_denoise_num
-    # create the CAC controller.
+
+    is_uvit = _args.backbone == "uvit"
+    edit_amp = 1.0
+    if is_uvit:
+        sa_blend = 0.3
+        ca_blend = 0.4
+        cross_replace_steps = min(cross_replace_steps, 0.4)
+        self_replace_steps = min(self_replace_steps, 0.3)
+    else:
+        sa_blend = 1.0
+        ca_blend = 1.0
+
     local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=False)
     controller = AttentionRefine([source_prompt, target_prompt],[[local, mutual]],
                     num_inference_steps,
                     num_start,
                     cross_replace_steps=cross_replace_steps,
                     self_replace_steps=self_replace_steps,
-                    local_blend=local_blend
+                    local_blend=local_blend,
+                    sa_blend_factor=sa_blend,
+                    ca_blend_factor=ca_blend,
                     )
     ptp_utils.register_attention_control(pipe, controller)
+    if _args.backbone == "uvit":
+        uvit_register(pipe.unet, controller)
+
+    # Sanity check: ensure attention processors are actually attached
+    if _args.backbone == "uvit":
+        if not has_attention_processors(pipe.unet):
+            raise RuntimeError("No UAC processors attached to UViT backbone.")
+    else:
+        attached = any(
+            hasattr(m, "processor") and getattr(m, "processor") is not None
+            for m in pipe.unet.modules()
+        )
+        if not attached:
+            raise RuntimeError("No attention processors attached to U-Net.")
 
     results = pipe(prompt=target_prompt,
                    source_prompt=source_prompt,
@@ -400,7 +458,8 @@ def inference(img, source_prompt, target_prompt,
                    guidance_scale=guidance_t,
                    source_guidance_scale=guidance_s,
                    denoise_model=denoise,
-                   callback = controller.step_callback
+                   callback = controller.step_callback,
+                   edit_amplification=edit_amp,
                    )
 
     return replace_nsfw_images(results)
@@ -628,4 +687,3 @@ with gr.Blocks(css=css) as demo:
           thresh_e, thresh_m, denoise],
         image_out, inference, examples_per_page=20)
 demo.launch(debug=False, share=False)
-

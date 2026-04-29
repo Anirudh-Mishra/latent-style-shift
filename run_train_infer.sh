@@ -20,20 +20,40 @@ else
     echo "Data already exists in /tmp. Skipping unzip."
 fi
 
+# --- 2b. PREPARE COCO (for training) ---
+# Defaults; adjust if your dataset lives elsewhere
+COCO_ANNOTATIONS="data/annotations/captions_train2017.json"
+COCO_IMAGES_DIR="data/train2017"
+COCO_OUT_DIR="/tmp/UNet_Data/COCO_for_training"
+
+if [ ! -f "$COCO_OUT_DIR/mapping_file.json" ]; then
+    echo "Preparing COCO mapping for training..."
+    mkdir -p "$COCO_OUT_DIR"
+    python scripts/prepare_coco_for_uvit.py \
+      --coco_annotations "$COCO_ANNOTATIONS" \
+      --images_dir "$COCO_IMAGES_DIR" \
+      --out_dir "$COCO_OUT_DIR"
+else
+    echo "COCO mapping already exists at $COCO_OUT_DIR/mapping_file.json; skipping prep."
+fi
+
 # --- 3. RUN THE MODEL ---
 echo "Starting training..."
 
 # I used the cleaned version of your command
 # Note: I'm saving outputs to Ocean so they aren't lost when the node resets
+# Train on COCO-prepared dataset (mapping_file.json produced above)
 python model/train_uvit.py \
-  --data_dir /tmp/UNet_Data/PIE-Bench_v1/ \
-  --uvit_size mid \
-  --batch_size 8 \
-  --num_epochs 100 \
-  --lr 1e-4 \
-  --output_dir /ocean/projects/cis260127p/adube1/outputs/uvit_mid_seed42_edit_instruction \
-  --seed 42 \
-  --use_amp
+    --data_dir "$COCO_OUT_DIR" \
+    --coco_annotations "$COCO_ANNOTATIONS" \
+    --coco_images_dir "$COCO_IMAGES_DIR" \
+    --uvit_size mid \
+    --batch_size 8 \
+    --num_epochs 100 \
+    --lr 1e-4 \
+    --output_dir /ocean/projects/cis260127p/adube1/outputs/uvit_mid_seed42_edit_instruction \
+    --seed 42 \
+    --use_amp
 
 
 echo "Starting inferencing..."

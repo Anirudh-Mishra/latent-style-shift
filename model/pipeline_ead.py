@@ -516,6 +516,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         denoise_model: Optional[bool] = True,
+        edit_amplification: Optional[float] = 1.0,
     ):
         # 1. Check inputs
         self.check_inputs(prompt, strength, callback_steps)
@@ -633,11 +634,19 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                         dim=0,
                     )
 
+                # For source-conditioned UViT backbones the clean source latent
+                # is concatenated channel-wise inside UViTBackbone.forward().
+                # Expand clean_latents to match the stacked batch dimension
+                # (3 streams × CFG factor).  The UNet path ignores this kwarg.
+                _n_repeats = concat_latent_model_input.shape[0] // latents.shape[0]
+                _source_latent_expanded = clean_latents.repeat(_n_repeats, 1, 1, 1)
+
                 concat_noise_pred = self.unet(
                     concat_latent_model_input,
                     t,
                     cross_attention_kwargs=cross_attention_kwargs,
                     encoder_hidden_states=concat_prompt_embeds,
+                    source_latent=_source_latent_expanded,
                 ).sample
 
                 # perform guidance
@@ -661,6 +670,12 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
                 else:
                     (source_noise_pred, noise_pred, mutual_noise_pred) = concat_noise_pred.chunk(3, dim=0)
+
+                if edit_amplification != 1.0:
+                    edit_delta = noise_pred - source_noise_pred
+                    noise_pred = source_noise_pred + edit_amplification * edit_delta
+                    mutual_delta = mutual_noise_pred - source_noise_pred
+                    mutual_noise_pred = source_noise_pred + edit_amplification * mutual_delta
 
                 noise = torch.randn(
                     latents.shape, dtype=latents.dtype, device=latents.device, generator=generator

@@ -3,6 +3,7 @@ from torchvision.transforms import Resize
 from torchvision import transforms
 import torch.nn.functional as F
 import numpy as np
+from transformers import CLIPModel, CLIPProcessor
 from torchmetrics.multimodal import CLIPScore
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -271,7 +272,11 @@ class LossG(torch.nn.Module):
 class MetricsCalculator:
     def __init__(self, device) -> None:
         self.device=device
+        # Keep torchmetrics CLIPScore available but also load HF CLIP directly
+        # and use it as a robust fallback to compute normalized embeddings.
         self.clip_metric_calculator = CLIPScore(model_name_or_path="openai/clip-vit-large-patch14").to(device)
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
         self.psnr_metric_calculator = PeakSignalNoiseRatio(data_range=1.0).to(device)
         self.lpips_metric_calculator = LearnedPerceptualImagePatchSimilarity(net_type='squeeze').to(device)
         self.mse_metric_calculator = MeanSquaredError().to(device)
@@ -294,12 +299,55 @@ class MetricsCalculator:
             mask = np.array(mask)
             img = np.uint8(img * mask)
             
-        img_tensor=torch.tensor(img).permute(2,0,1).to(self.device)
-        
-        score = self.clip_metric_calculator(img_tensor, txt)
-        score = score.cpu().item()
-        
-        return score
+        # Ensure a batch dimension and pass text as a list so torchmetrics' CLIPScore
+        # returns embeddings (not raw model outputs). Previously a single-image
+        # tensor without batch dim could cause the metric to forward the HF model
+        # and return a BaseModelOutputWithPooling object.
+        img_tensor = torch.tensor(img).permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+        # Compute CLIP embeddings directly to avoid torchmetrics/HF return-type
+        # mismatches. Use the HF processor to build inputs and the model's
+        # get_image_features/get_text_features API to obtain tensors.
+        try:
+            image_inputs = self.clip_processor(images=[img], return_tensors="pt")
+            image_inputs = {k: v.to(self.device) for k, v in image_inputs.items()}
+            with torch.no_grad():
+                img_feats = self.clip_model.get_image_features(**image_inputs)
+            # handle HF model outputs that may be BaseModelOutputWithPooling-like
+            if not torch.is_tensor(img_feats):
+                if hasattr(img_feats, 'pooler_output'):
+                    img_feats = img_feats.pooler_output
+                elif hasattr(img_feats, 'image_embeds'):
+                    img_feats = img_feats.image_embeds
+                elif isinstance(img_feats, (list, tuple)):
+                    for v in img_feats:
+                        if torch.is_tensor(v):
+                            img_feats = v
+                            break
+            text_inputs = self.clip_processor(text=[txt], return_tensors="pt")
+            text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+            with torch.no_grad():
+                txt_feats = self.clip_model.get_text_features(**text_inputs)
+            if not torch.is_tensor(txt_feats):
+                if hasattr(txt_feats, 'pooler_output'):
+                    txt_feats = txt_feats.pooler_output
+                elif hasattr(txt_feats, 'text_embeds'):
+                    txt_feats = txt_feats.text_embeds
+                elif isinstance(txt_feats, (list, tuple)):
+                    for v in txt_feats:
+                        if torch.is_tensor(v):
+                            txt_feats = v
+                            break
+
+            img_feats = img_feats / img_feats.norm(p=2, dim=-1, keepdim=True)
+            txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
+            # cosine similarity between first (and only) image and text
+            score = (img_feats * txt_feats).sum(dim=-1).cpu().item()
+            return score
+        except Exception:
+            # Fallback to torchmetrics if anything goes wrong with direct HF call
+            score = self.clip_metric_calculator(img_tensor, [txt])
+            return score.cpu().item()
     
     def calculate_psnr(self, img_pred, img_gt, mask_pred=None, mask_gt=None):
         img_pred = np.array(img_pred).astype(np.float32)/255
