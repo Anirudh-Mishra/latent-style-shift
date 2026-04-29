@@ -490,6 +490,14 @@ def train(args):
             # uses empty/null conditioning, not the editing instruction.
             null_emb = null_text_emb.expand(B, -1, -1).to(device)
 
+            # CFG dropout: randomly replace edit text with null so the model learns
+            # distinguishable epsilon(z, text) vs epsilon(z, null). Required for any
+            # guidance scale > 1 at inference to produce a meaningful edit direction.
+            # Must happen here so that BOTH the teacher pass (target_teacher) and the
+            # student pass (pred_t) see the same potentially-dropped text.
+            if args.cfg_dropout_prob > 0.0 and torch.rand(1).item() < args.cfg_dropout_prob:
+                encoder_hidden_states = null_emb.clone()
+
             timesteps = torch.randint(
                 0, scheduler.config.num_train_timesteps,
                 (B,), device=device, dtype=torch.long,
@@ -682,6 +690,10 @@ if __name__ == "__main__":
                         help="Weight for the edit direction loss MSE(pred_t - pred_s, teacher_t - teacher_s). "
                              "Directly trains the DDCM quantity e_t - e_s to encode the edit. "
                              "Recommended: 0.5 for Phase 2. Default 0 (disabled) for backward compatibility.")
+    parser.add_argument("--cfg_dropout_prob", type=float, default=0.0,
+                        help="Probability of replacing edit text with null text each step. "
+                             "Recommended 0.10 — required for the model to learn distinguishable "
+                             "epsilon(z, text) vs epsilon(z, null), which is what CFG-style guidance amplifies.")
     parser.add_argument("--encoded_data_dir", type=str, default=None,
                         help="Directory of pre-encoded latents+embeddings from prepare_encoded_dataset.py. "
                              "Skips VAE/CLIP inference every step (~70 ms/step savings).")

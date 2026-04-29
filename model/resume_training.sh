@@ -125,49 +125,121 @@ python prepare_encoded_dataset.py \
 
 STAGE2_BEST="$STAGE2_OUT/uvit_mid_best.pt"
 
-# --- Stage 3: Same-latent CFG fine-tuning ---
+# =====================================================================
+# OPTION B: UNet cross-attention init + three training patches
+# =====================================================================
+# Step 1: Build hybrid checkpoint (MAE self-attn + UNet cross-attn)
+# Step 2: Stage A — distillation only, let cross-attn settle into network
+# Step 3: Stage B — full edit-direction training with all three patches
+# =====================================================================
+
+OPTB_INIT=./checkpoints/uvit_mae_self_unet_cross.pt
+OPTB_STAGE_A_OUT=./checkpoints/uvit_optb_stage_a/
+OPTB_STAGE_B_OUT=./checkpoints/uvit_optb_stage_b/
+
+# --- Step 1: Build hybrid init (~2 minutes) ---
 echo ""
 echo "=========================================="
-echo "Stage 3: Same-Latent CFG Fine-tuning"
+echo "Option B Step 1: Building hybrid init checkpoint"
 echo "=========================================="
 
-STAGE3_OUT=./checkpoints/uvit_phase3/
-STAGE3_BEST="$STAGE3_OUT/uvit_mid_best.pt"
+if [ ! -f "$OPTB_INIT" ]; then
+    python init_from_unet_cross_only.py \
+        --mae_checkpoint ./checkpoints/uvit_from_mae.pt \
+        --out "$OPTB_INIT" \
+        --uvit_size mid \
+        --img_size 64 \
+        --patch_size 2
+else
+    echo "Hybrid init already exists at $OPTB_INIT — skipping."
+fi
 
-# Stage 3 extended: resume from Phase 3 best and push edit direction harder
-STAGE3_EXT_OUT=./checkpoints/uvit_phase3_ext/
+if [ ! -f "$OPTB_INIT" ]; then
+    echo "ERROR: hybrid init was not produced. Aborting."
+    exit 1
+fi
+
+# --- Step 2: Stage A — distillation only (~30 minutes) ---
+# Lets cross-attention adapt to the dimensional mismatch from bilinear resize.
+# CFG dropout is on so the model learns text/null separation from step 0,
+# but no edit_loss or same-latent forcing yet — keep it gentle while the
+# resized cross-attn weights find their footing alongside MAE self-attn.
+echo ""
+echo "=========================================="
+echo "Option B Step 2: Stage A — distillation"
+echo "=========================================="
 
 python train_uvit.py \
   --reset_epoch \
   --distill \
   --encoded_data_dir "$ENCODED_DIR" \
-  --resume "$STAGE3_BEST" \
+  --resume "$OPTB_INIT" \
   --uvit_size mid \
   --latent_size 64 \
   --patch_size 2 \
   --batch_size 16 \
-  --num_epochs 10 \
-  --lr 3e-6 \
+  --num_epochs 8 \
+  --lr 1e-4 \
   --weight_decay 0.01 \
-  --warmup_steps 200 \
+  --warmup_steps 500 \
   --max_grad_norm 1.0 \
   --num_workers 4 \
-  --output_dir "$STAGE3_EXT_OUT" \
+  --output_dir "$OPTB_STAGE_A_OUT" \
   --log_every 50 \
   --save_every 1 \
   --use_amp \
   --bf16 \
   --grad_accum_steps 1 \
   --seed 42 \
-  --inject_alpha 0.3 \
+  --inject_alpha 0.0 \
+  --edit_loss_weight 0.0 \
+  --same_latent_prob 0.0 \
+  --cfg_dropout_prob 0.10
+
+OPTB_STAGE_A_BEST="$OPTB_STAGE_A_OUT/uvit_mid_best.pt"
+if [ ! -f "$OPTB_STAGE_A_BEST" ]; then
+    echo "ERROR: Stage A did not produce a best checkpoint. Aborting."
+    exit 1
+fi
+
+# --- Step 3: Stage B — full edit-direction training (~45 minutes) ---
+# All three bug fixes active. Lower lr to refine without destroying Stage A.
+echo ""
+echo "=========================================="
+echo "Option B Step 3: Stage B — edit-direction training"
+echo "=========================================="
+
+python train_uvit.py \
+  --reset_epoch \
+  --distill \
+  --encoded_data_dir "$ENCODED_DIR" \
+  --resume "$OPTB_STAGE_A_BEST" \
+  --uvit_size mid \
+  --latent_size 64 \
+  --patch_size 2 \
+  --batch_size 16 \
+  --num_epochs 8 \
+  --lr 2e-5 \
+  --weight_decay 0.01 \
+  --warmup_steps 500 \
+  --max_grad_norm 1.0 \
+  --num_workers 4 \
+  --output_dir "$OPTB_STAGE_B_OUT" \
+  --log_every 50 \
+  --save_every 1 \
+  --use_amp \
+  --bf16 \
+  --grad_accum_steps 1 \
+  --seed 42 \
+  --inject_alpha 0.0 \
   --edit_loss_weight 0.7 \
-  --same_latent_prob 0.6
+  --same_latent_prob 1.0 \
+  --cfg_dropout_prob 0.10
 
 echo ""
 echo "=========================================="
-echo "Training complete."
-echo "  Stage 1 best: $STAGE1_OUT/uvit_mid_best.pt"
-echo "  Stage 2 best: $STAGE2_OUT/uvit_mid_best.pt"
-echo "  Stage 3 best: $STAGE3_OUT/uvit_mid_best.pt"
-echo "Use Stage 3 best for inference."
+echo "Option B training complete."
+echo "  Stage A best: $OPTB_STAGE_A_OUT/uvit_mid_best.pt"
+echo "  Stage B best: $OPTB_STAGE_B_OUT/uvit_mid_best.pt"
+echo "Use Stage B best for inference."
 echo "=========================================="
