@@ -26,9 +26,9 @@ echo "Starting inferencing..."
 python model/run_uvit_inference.py \
     --checkpoint  /home/avid/latent-style-shift/model/checkpoints/uvit_phase3/uvit_mid_best.pt \
     --source_path /home/avid/dl_data/PIE-Bench_v1/ \
-    --target_path /home/avid/dl_data/outputs/uvit_test_outputs/ \
+    --target_path /home/avid/dl_data/outputs/uvit_phase3/ \
     --denoise \
-    --guidance_t 4.0 \
+    --guidance_t 1.3 \
     --guidance_s 1.0 \
     --cross_replace_steps 0.4 \
     --self_replace_steps 0.4 \

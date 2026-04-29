@@ -169,11 +169,22 @@ echo "=========================================="
 echo "Option B Step 2: Stage A — distillation"
 echo "=========================================="
 
+# Auto-resume from latest epoch checkpoint if available, else start from hybrid init
+if ls "$OPTB_STAGE_A_OUT"uvit_mid_epoch*.pt 1>/dev/null 2>&1; then
+    STAGE_A_RESUME=$(ls -t "$OPTB_STAGE_A_OUT"uvit_mid_epoch*.pt | head -1)
+    STAGE_A_RESET=""
+    echo "Resuming Stage A from: $STAGE_A_RESUME"
+else
+    STAGE_A_RESUME="$OPTB_INIT"
+    STAGE_A_RESET="--reset_epoch"
+    echo "Starting Stage A fresh from hybrid init: $STAGE_A_RESUME"
+fi
+
 python train_uvit.py \
-  --reset_epoch \
+  $STAGE_A_RESET \
   --distill \
   --encoded_data_dir "$ENCODED_DIR" \
-  --resume "$OPTB_INIT" \
+  --resume "$STAGE_A_RESUME" \
   --uvit_size mid \
   --latent_size 64 \
   --patch_size 2 \

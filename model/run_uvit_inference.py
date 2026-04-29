@@ -32,6 +32,8 @@ def main():
                         help="Source guidance scale")
     parser.add_argument("--source_conditioned", action="store_true",
                         help="Enable source-conditioned UViT; must match training/init")
+    parser.add_argument("--patch_smooth_sigma", type=float, default=0.7,
+                        help="Gaussian sigma to suppress 2-pixel patch artifacts at inference. 0 disables.")
 
     args = parser.parse_args()
 
@@ -58,6 +60,7 @@ def main():
         "--thresh_m", str(args.thresh_m),
         "--guidance_t", str(args.guidance_t),
         "--guidance_s", str(args.guidance_s),
+        "--patch_smooth_sigma", str(args.patch_smooth_sigma),
     ]
     if args.denoise:
         cmd.append("--denoise")

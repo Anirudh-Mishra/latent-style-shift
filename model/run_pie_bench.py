@@ -556,10 +556,40 @@ def main():
         if args.uvit_checkpoint:
             missing, unexpected = _adapter.backbone.load_state_dict(state_dict, strict=False)
             print(f"Loaded UViT checkpoint from {args.uvit_checkpoint}")
-            if missing:
-                print(f"Warning: missing UViT checkpoint keys: {len(missing)}")
-            if unexpected:
-                print(f"Warning: unexpected UViT checkpoint keys: {len(unexpected)}")
+
+            # Fail LOUD on any mismatch. Silent partial loads were causing inference
+            # to run with random init in the unmatched layers, producing clean
+            # reconstructions but no editing. If you see this error, something about
+            # the checkpoint structure does not match the constructed UViT model.
+            if missing or unexpected:
+                print("=" * 70)
+                print("CHECKPOINT LOAD MISMATCH — REFUSING TO RUN INFERENCE")
+                print("=" * 70)
+                if missing:
+                    print(f"\n  Missing keys ({len(missing)}) — these MODEL params got random init:")
+                    for k in missing[:20]:
+                        print(f"    - {k}")
+                    if len(missing) > 20:
+                        print(f"    ... and {len(missing) - 20} more")
+                if unexpected:
+                    print(f"\n  Unexpected keys ({len(unexpected)}) — these CHECKPOINT params were dropped:")
+                    for k in unexpected[:20]:
+                        print(f"    - {k}")
+                    if len(unexpected) > 20:
+                        print(f"    ... and {len(unexpected) - 20} more")
+                print("\n  Detected from checkpoint:")
+                for k, v in uvit_overrides.items():
+                    print(f"    {k} = {v}")
+                print("\n  If this looks like a depth/embed_dim mismatch, the auto-detection")
+                print("  in run_pie_bench.py needs to be extended. If keys are unexpectedly")
+                print("  named (e.g. _orig_mod prefix), strip them before load_state_dict.")
+                print("=" * 70)
+                raise RuntimeError(
+                    f"Refusing to run inference with partial weight load: "
+                    f"{len(missing)} missing, {len(unexpected)} unexpected keys"
+                )
+
+            print(f"  -> Clean load: 0 missing, 0 unexpected keys.")
         _adapter = _adapter.to(dtype=torch_dtype)
         _adapter.eval()
         if torch.cuda.is_available():
